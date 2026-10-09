@@ -32,7 +32,7 @@ without touching a zone file by hand.
   contains manual records
 - Dry-run mode shows every change before you commit to anything
 
-**Status:** v1.6.2. In production since July 2026 on a Proxmox LXC, syncing
+**Status:** v1.6.3. In production since July 2026 on a Proxmox LXC, syncing
 roughly 100 UniFi clients into about 80 managed records every 5 minutes.
 1.3.0 fixed the record churn described in
 [Code review notes](#code-review-notes-october-2026), 1.4.0 added the
@@ -210,7 +210,7 @@ both from the Releases page, or with `curl` (set `VERSION` to the release you
 want):
 
 ```sh
-VERSION=1.6.2
+VERSION=1.6.3
 BASE=https://github.com/gordon15969/unifi-technitium-dns-sync/releases/download/v$VERSION
 curl -fL -O "$BASE/unifi-technitium-sync-$VERSION.tar.gz" -O "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -730,6 +730,10 @@ identifiable in Technitium by the `managed-by=unifi-technitium-sync` comment.
 
 ## Changelog
 
+- **1.6.3** (2026-10-09) — Documentation only: the repository is now public, so
+  the install instructions download a release with `curl` and no GitHub
+  account, instead of saying the repository is private and needs a signed-in
+  GitHub CLI. No code changes from 1.6.2.
 - **1.6.2** (2026-10-09) — Documentation only: the README now opens with a note
   that this is a vibe-coded app, created with Claude Code and reviewed for
   quality and security with OpenAI Codex, built for one specific network and
