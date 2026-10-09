@@ -205,19 +205,23 @@ release package or by cloning the repository, then run the installer as root
 from the unpacked directory.
 
 **From a release** (recommended). Each [release](../../releases) has a
-`unifi-technitium-sync-X.Y.Z.tar.gz` package and a `SHA256SUMS` file. This
-repository is private, so you need the GitHub CLI signed in to an account with
-access (`gh auth login`), or download the two files from the Releases page in
-a browser while signed in:
+`unifi-technitium-sync-X.Y.Z.tar.gz` package and a `SHA256SUMS` file. Download
+both from the Releases page, or with `curl` (set `VERSION` to the release you
+want):
 
 ```sh
-gh release download --repo gordon15969/unifi-technitium-dns-sync \
-  --pattern '*.tar.gz' --pattern SHA256SUMS
+VERSION=1.6.2
+BASE=https://github.com/gordon15969/unifi-technitium-dns-sync/releases/download/v$VERSION
+curl -fL -O "$BASE/unifi-technitium-sync-$VERSION.tar.gz" -O "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS
-tar xzf unifi-technitium-sync-*.tar.gz
-cd unifi-technitium-sync-*/
+tar xzf unifi-technitium-sync-$VERSION.tar.gz
+cd unifi-technitium-sync-$VERSION/
 sudo ./install.sh
 ```
+
+With the GitHub CLI, `gh release download --repo
+gordon15969/unifi-technitium-dns-sync --pattern '*.tar.gz' --pattern SHA256SUMS`
+fetches the latest release instead.
 
 **From git:** `git clone` the repository, `cd` into it, and run
 `sudo ./install.sh`.
