@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 MARKER = "managed-by=unifi-technitium-sync"
 STOP = False
 WAKE = threading.Event()
@@ -103,6 +103,7 @@ class Config:
     web_password_hash: str
     web_tls_cert: str | None
     web_tls_key: str | None
+    web_allow_insecure_lan: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -184,6 +185,7 @@ class Config:
             web_password_hash=env.get("WEB_PASSWORD_HASH", "").strip(),
             web_tls_cert=env.get("WEB_TLS_CERT") or None,
             web_tls_key=env.get("WEB_TLS_KEY") or None,
+            web_allow_insecure_lan=env_bool("WEB_ALLOW_INSECURE_LAN", False, env),
         )
 
 
@@ -232,6 +234,7 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("WEB_LISTEN", "text", "", "host:port for the embedded web UI, e.g. 0.0.0.0:8089; empty disables it", "Web UI", restart=True),
     Setting("WEB_TLS_CERT", "text", "", "PEM certificate chain to serve the web UI over HTTPS", "Web UI", restart=True),
     Setting("WEB_TLS_KEY", "text", "", "PEM private key for WEB_TLS_CERT", "Web UI", restart=True),
+    Setting("WEB_ALLOW_INSECURE_LAN", "bool", "false", "Allow plain HTTP on a non-loopback WEB_LISTEN without TLS. The password and session cookie then cross the network unencrypted; prefer TLS, an SSH tunnel or an HTTPS reverse proxy", "Web UI", restart=True),
     Setting("WEB_PASSWORD_HASH", "secret", "", "Set with --set-web-password or the password form", "Web UI"),
 )
 
@@ -353,6 +356,14 @@ def ssl_context(verify: bool, ca_file: str | None) -> ssl.SSLContext:
     return ssl.create_default_context(cafile=ca_file)
 
 
+class TransportError(RuntimeError):
+    """The request did not complete: unreachable host, HTTP error, or unreadable reply."""
+
+
+class ApiError(RuntimeError):
+    """The API answered but refused the operation (Technitium status other than ok)."""
+
+
 def request_json(
     url: str,
     headers: dict[str, str],
@@ -373,15 +384,15 @@ def request_json(
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Cannot reach {url}: {exc.reason}") from exc
+        raise TransportError(f"HTTP {exc.code} from {url}: {body[:500]}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise TransportError(f"Cannot reach {url}: {getattr(exc, 'reason', exc)}") from exc
     try:
         data = json.loads(payload)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Non-JSON response from {url}: {payload[:200]}") from exc
+        raise TransportError(f"Non-JSON response from {url}: {payload[:200]}") from exc
     if not isinstance(data, dict):
-        raise RuntimeError(f"Unexpected response from {url}: expected a JSON object")
+        raise TransportError(f"Unexpected response from {url}: expected a JSON object")
     return data
 
 
@@ -438,6 +449,9 @@ class TechnitiumClient:
             "User-Agent": f"unifi-technitium-sync/{VERSION}",
         }
         self.actions: list[dict[str, str]] = []
+        # PTR deletions that failed for a transient reason in this cycle; the
+        # synchronizer persists them and retries them on later cycles.
+        self.ptr_failures: list[dict[str, str]] = []
 
     def _call(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         data = request_json(
@@ -449,7 +463,7 @@ class TechnitiumClient:
         )
         if data.get("status") != "ok":
             message = data.get("errorMessage") or data.get("status") or "unknown error"
-            raise RuntimeError(f"Technitium API error: {message}")
+            raise ApiError(f"Technitium API error: {message}")
         return data
 
     def records(self) -> list[dict[str, Any]]:
@@ -501,12 +515,14 @@ class TechnitiumClient:
         if self.config.create_ptr:
             self.delete_ptr(fqdn, address)
 
-    def delete_ptr(self, fqdn: str, address: str) -> None:
+    def delete_ptr(self, fqdn: str, address: str, queue: bool = True) -> bool:
         """Remove the PTR left behind by an A-record deletion.
 
         Technitium's records/delete API does not cascade to the reverse zone.
         The ptrName filter ensures only a PTR still pointing at the deleted
-        name is removed; a missing zone or already-replaced PTR is ignored.
+        name is removed. Returns True when the PTR is gone or was never ours
+        (Technitium refused: no such zone or record), False after a transient
+        failure, which is recorded in ptr_failures when queue is True.
         """
         reverse_name = ipaddress.ip_address(address).reverse_pointer
         LOG.info(
@@ -517,14 +533,23 @@ class TechnitiumClient:
         )
         self.actions.append({"op": "DELETE", "type": "PTR", "name": reverse_name, "value": fqdn})
         if self.dry_run:
-            return
+            return True
         try:
             self._call(
                 "/api/zones/records/delete",
                 {"domain": reverse_name, "type": "PTR", "ptrName": fqdn},
             )
+        except ApiError as exc:
+            LOG.debug("PTR cleanup not needed for %s (%s): %s", fqdn, reverse_name, exc)
         except RuntimeError as exc:
-            LOG.debug("PTR cleanup skipped for %s (%s): %s", fqdn, reverse_name, exc)
+            LOG.warning(
+                "Could not delete the PTR %s -> %s; will retry on later cycles: %s",
+                reverse_name, fqdn, exc,
+            )
+            if queue:
+                self.ptr_failures.append({"fqdn": fqdn, "address": address})
+            return False
+        return True
 
     def ensure_ptr(self, fqdn: str, address: str) -> None:
         """Create or refresh the PTR for an existing managed A record."""
@@ -606,10 +631,16 @@ def field_priority(fields: tuple[str, ...], field: str) -> int:
 
 
 def client_mac(client: dict[str, Any]) -> str:
+    """The client's MAC as 12 lowercase hex digits, or "" when absent or malformed.
+
+    A malformed MAC gets no naming memory (it is handled like a MAC-less
+    client) because the de-duplication suffixes are taken from it.
+    """
     for field in ("macAddress", "mac", "mac_address"):
         value = client.get(field)
         if isinstance(value, str) and value.strip():
-            return re.sub(r"[^0-9a-f]", "", value.lower())
+            mac = re.sub(r"[:.\s-]", "", value.strip().lower())
+            return mac if re.fullmatch(r"[0-9a-f]{12}", mac) else ""
     return ""
 
 
@@ -754,12 +785,27 @@ def resolve_label(
     return entry
 
 
-def assign_suffixes(config: Config, memory: dict[str, dict[str, Any]]) -> None:
-    """Suffix every client whose label is shared with another remembered client.
+SUFFIX_LENGTHS = (6, 8, 10, 12)
 
-    Grouping covers clients that are offline but still remembered, so a
-    device's name does not depend on which of its namesakes is online.
+
+def assign_suffixes(
+    config: Config,
+    memory: dict[str, dict[str, Any]],
+    previous: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Give every remembered client a record label no other client has.
+
+    Clients sharing a label get a suffix from the end of their MAC: six hex
+    digits, or more when two of those MACs end in the same six. Grouping covers
+    clients that are offline but still remembered, so a device's name does not
+    depend on which of its namesakes is online.
+
+    A client keeps exactly the name it held last cycle (taken from previous)
+    while that name is still valid for it, so a newcomer, even one that copies
+    a victim's hostname and the end of its MAC, can never take that name over;
+    newcomers get the shortest form nobody holds.
     """
+    previous = previous or {}
     groups: dict[str, list[str]] = {}
     for mac, entry in memory.items():
         label = str(entry.get("label", ""))
@@ -767,9 +813,33 @@ def assign_suffixes(config: Config, memory: dict[str, dict[str, Any]]) -> None:
             groups.setdefault(label, []).append(mac)
         else:
             entry["suffix"] = ""
-    for macs in groups.values():
+
+    taken: set[str] = set()
+    assigned: set[str] = set()
+    for label, macs in groups.items():
+        shared = len(macs) > 1
         for mac in macs:
-            memory[mac]["suffix"] = mac[-6:] if len(macs) > 1 else ""
+            old = previous.get(mac)
+            if not isinstance(old, dict) or str(old.get("label", "")) != label:
+                continue
+            suffix = str(old.get("suffix", ""))
+            valid = (len(suffix) in SUFFIX_LENGTHS and mac.endswith(suffix)) if shared else suffix == ""
+            name = record_label(label, suffix)
+            if valid and name not in taken:
+                memory[mac]["suffix"] = suffix
+                taken.add(name)
+                assigned.add(mac)
+
+    for label in sorted(groups):
+        macs = sorted(groups[label])
+        shared = len(macs) > 1
+        for mac in macs:
+            if mac in assigned:
+                continue
+            options = ([] if shared else [""]) + [mac[-n:] for n in SUFFIX_LENGTHS]
+            choice = next((s for s in options if record_label(label, s) not in taken), mac)
+            memory[mac]["suffix"] = choice
+            taken.add(record_label(label, choice))
 
 
 def record_label(label: str, suffix: str) -> str:
@@ -816,27 +886,48 @@ def desired_records(
         if mac not in next_memory and now - int(entry.get("last_seen", 0)) < config.name_memory_ttl:
             next_memory[mac] = dict(entry)
 
-    assign_suffixes(config, next_memory)
+    assign_suffixes(config, next_memory, memory)
+    for mac, entry in next_memory.items():
+        suffix = str(entry.get("suffix", ""))
+        old_suffix = str((memory.get(mac) or {}).get("suffix", ""))
+        if len(suffix) > SUFFIX_LENGTHS[0] and suffix != old_suffix:
+            LOG.warning(
+                "Clients named %s share the last %d MAC digits; %s gets the longer suffix %s",
+                entry.get("label"), SUFFIX_LENGTHS[0], mac, suffix,
+            )
 
     desired: dict[str, dict[str, str]] = {}
-    for mac, address in online.items():
+    taken: set[str] = set()
+    for entry in next_memory.values():
+        label = str(entry.get("label", ""))
+        if label and label not in config.excluded_names:
+            taken.add(record_label(label, str(entry.get("suffix", ""))))
+    for mac, address in sorted(online.items()):
         entry = next_memory[mac]
         label = str(entry.get("label", ""))
         if not label or label in config.excluded_names:
             continue
         fqdn = f"{record_label(label, str(entry.get('suffix', '')))}.{config.dns_zone}"
+        if fqdn in desired:  # cannot happen after assign_suffixes; never overwrite regardless
+            LOG.warning("Two clients would share %s; skipping %s", fqdn, mac)
+            continue
         desired[fqdn] = {"ip": address, "mac": mac}
 
     remembered = {str(entry.get("label", "")) for entry in next_memory.values()}
     stateless_counts: dict[str, int] = {}
     for label, _ in stateless:
         stateless_counts[label] = stateless_counts.get(label, 0) + 1
-    for label, address in stateless:
+    for label, address in sorted(stateless):
         if label in config.excluded_names:
             continue
-        collides = label in remembered or stateless_counts[label] > 1
-        suffix = address.replace(".", "-") if collides else ""
-        desired[f"{record_label(label, suffix)}.{config.dns_zone}"] = {"ip": address, "mac": ""}
+        collides = label in remembered or label in taken or stateless_counts[label] > 1
+        name = record_label(label, address.replace(".", "-") if collides else "")
+        fqdn = f"{name}.{config.dns_zone}"
+        if name in taken or fqdn in desired:
+            LOG.warning("Skipping a client without a usable MAC at %s: %s is already in use", address, fqdn)
+            continue
+        taken.add(name)
+        desired[fqdn] = {"ip": address, "mac": ""}
 
     return dict(sorted(desired.items())), next_memory
 
@@ -852,10 +943,18 @@ def record_is_managed(record: dict[str, Any]) -> bool:
 
 
 STATE_VERSION = 2
+PTR_RETRY_MAX_AGE = 7 * 86400
+PTR_QUEUE_LIMIT = 500
 
 
 def empty_state() -> dict[str, Any]:
-    return {"version": STATE_VERSION, "managed_records": {}, "pending": {}, "clients": {}}
+    return {
+        "version": STATE_VERSION,
+        "managed_records": {},
+        "pending": {},
+        "clients": {},
+        "ptr_cleanup": [],
+    }
 
 
 def migrate_state(data: dict[str, Any], zone: str) -> dict[str, Any]:
@@ -867,6 +966,8 @@ def migrate_state(data: dict[str, Any], zone: str) -> dict[str, Any]:
     """
     if not isinstance(data.get("pending"), dict):
         data["pending"] = {}
+    if not isinstance(data.get("ptr_cleanup"), list):
+        data["ptr_cleanup"] = []
     if not isinstance(data.get("clients"), dict):
         clients: dict[str, dict[str, Any]] = {}
         zone_suffix = f".{zone}"
@@ -922,6 +1023,70 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def queue_ptr_failures(
+    queue: list[Any], failures: list[dict[str, str]], now: int
+) -> list[dict[str, Any]]:
+    """Add newly failed PTR deletions to the retry queue, without duplicates."""
+    merged = [item for item in queue if isinstance(item, dict)]
+    known = {(str(item.get("fqdn", "")), str(item.get("address", ""))) for item in merged}
+    for failure in failures:
+        key = (failure["fqdn"], failure["address"])
+        if key not in known:
+            merged.append({"fqdn": key[0], "address": key[1], "since": now, "attempts": 1})
+            known.add(key)
+    return merged[-PTR_QUEUE_LIMIT:]
+
+
+def retry_ptr_cleanup(
+    technitium: TechnitiumClient,
+    queue: list[Any],
+    next_managed: dict[str, dict[str, Any]],
+    now: int,
+) -> list[dict[str, Any]]:
+    """Retry PTR deletions that failed on earlier cycles; return those still pending.
+
+    An entry is dropped without a call when its name points at that address
+    again (the PTR is current, not stale), and abandoned with a warning after
+    PTR_RETRY_MAX_AGE.
+    """
+    remaining: list[dict[str, Any]] = []
+    for item in queue:
+        if not isinstance(item, dict):
+            continue
+        fqdn, address = str(item.get("fqdn", "")), str(item.get("address", ""))
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if not fqdn:
+            continue
+        if str(next_managed.get(fqdn, {}).get("ip", "")) == address:
+            LOG.debug("Dropping the queued PTR deletion for %s -> %s: it is current again", fqdn, address)
+            continue
+        since = int(item.get("since", now))
+        if now - since >= PTR_RETRY_MAX_AGE:
+            LOG.warning(
+                "Giving up on deleting the PTR for %s (%s) after %d days; remove it by hand if it still exists",
+                fqdn, address, (now - since) // 86400,
+            )
+            continue
+        if technitium.delete_ptr(fqdn, address, queue=False):
+            continue
+        remaining.append({**item, "attempts": int(item.get("attempts", 0)) + 1})
+    return remaining
+
+
+def persist_ptr_failures(config: Config, failures: list[dict[str, str]], now: int) -> None:
+    """Record PTR deletions that failed in a cycle that did not complete.
+
+    The cycle's other changes are not saved, but the forward records it
+    already deleted are gone, so without this the PTRs would never be retried.
+    """
+    state = load_state(config.state_file, config.dns_zone)
+    state["ptr_cleanup"] = queue_ptr_failures(state["ptr_cleanup"], failures, now)
+    save_state(config.state_file, state)
+
+
 def synchronize(
     config: Config,
     unifi: UnifiClient,
@@ -931,8 +1096,29 @@ def synchronize(
 ) -> SyncResult:
     if now is None:
         now = int(time.time())
+    ptr_start = len(getattr(technitium, "ptr_failures", []))
+    try:
+        return _synchronize(config, unifi, technitium, dry_run, now)
+    except Exception:
+        failures = getattr(technitium, "ptr_failures", [])[ptr_start:]
+        if failures and not dry_run:
+            try:
+                persist_ptr_failures(config, failures, now)
+            except Exception:  # noqa: BLE001 - keep the original error
+                LOG.exception("Could not record failed PTR deletions")
+        raise
+
+
+def _synchronize(
+    config: Config,
+    unifi: UnifiClient,
+    technitium: TechnitiumClient,
+    dry_run: bool,
+    now: int,
+) -> SyncResult:
     clock_start = time.monotonic()
     action_start = len(technitium.actions)
+    ptr_start = len(technitium.ptr_failures)
     deferred: list[dict[str, str]] = []
     state = load_state(config.state_file, config.dns_zone)
     previous: dict[str, dict[str, Any]] = state["managed_records"]
@@ -998,6 +1184,7 @@ def synchronize(
             continue
 
         old_address = str(owned.get("ip", "")) if owned else ""
+        stale_address = ""
         if old_address and old_address != address:
             # Dampen IP changes: only apply after the same new address has been
             # reported for ip_stable_polls consecutive cycles.
@@ -1025,10 +1212,14 @@ def synchronize(
                 }
                 continue
             if old_address in existing_addresses:
-                technitium.delete_a(fqdn, old_address)
-                existing_addresses.discard(old_address)
+                stale_address = old_address
+        # Add the new address before removing the old one: if the second call
+        # fails the name still resolves (to both for a moment) instead of
+        # resolving to nothing until the next successful cycle.
         if address not in existing_addresses:
             technitium.add_a(fqdn, address)
+        if stale_address:
+            technitium.delete_a(fqdn, stale_address)
         next_managed[fqdn] = {"ip": address, "mac": item["mac"], "last_seen": now}
 
     mac_to_fqdn = {
@@ -1061,6 +1252,16 @@ def synchronize(
         else:
             LOG.warning("Not deleting %s: the owned record marker or address no longer matches", fqdn)
 
+    ptr_queue = retry_ptr_cleanup(technitium, state["ptr_cleanup"], next_managed, now)
+    ptr_queue = queue_ptr_failures(ptr_queue, technitium.ptr_failures[ptr_start:], now)
+    for item in ptr_queue:
+        deferred.append({
+            "name": ipaddress.ip_address(item["address"]).reverse_pointer,
+            "kind": "ptr",
+            "detail": f"deleting PTR -> {item['fqdn']} failed; retrying "
+                      f"(attempt {item.get('attempts', 1)})",
+        })
+
     LOG.info(
         "Sync complete: %d UniFi clients, %d desired records, %d tracked records",
         len(clients),
@@ -1078,6 +1279,7 @@ def synchronize(
                 "managed_records": next_managed,
                 "pending": next_pending,
                 "clients": next_memory,
+                "ptr_cleanup": ptr_queue,
             },
         )
     online_macs = {item["mac"] for item in desired.values()}

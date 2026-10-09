@@ -28,9 +28,9 @@ from urllib.parse import parse_qs, urlsplit
 
 SESSION_COOKIE = "uts_session"
 SESSION_TTL = 12 * 3600
-LOGIN_WINDOW = 300
-LOGIN_MAX_FAILURES = 5
-LOGIN_LOCK_SECONDS = 60
+LOGIN_WINDOW = 300          # seconds a failed attempt counts against its address
+LOGIN_MAX_FAILURES = 5      # failed attempts allowed per address within LOGIN_WINDOW
+AUTH_CONCURRENCY = 2        # password checks (PBKDF2) running at once, all addresses
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 MAX_BODY = 256 * 1024
 
@@ -48,8 +48,11 @@ class WebState:
         self.lock = threading.Lock()
         self.sessions: dict[str, dict[str, Any]] = {}
         self.failures: dict[str, list[float]] = {}
+        self.inflight: set[str] = set()
+        self.auth_slots = threading.BoundedSemaphore(AUTH_CONCURRENCY)
         self.anonymous = {"csrf": secrets.token_urlsafe(32), "expires": float("inf")}
         self.tls = bool(runtime.current_config().web_tls_cert)
+        self.insecure_transport = False  # set by start() for plain HTTP on a network address
 
     def password_set(self) -> bool:
         return bool(self.runtime.password_hash())
@@ -57,23 +60,45 @@ class WebState:
     def auth_required(self) -> bool:
         return self.password_set()
 
-    def login(self, password: str, client_ip: str) -> str | None:
+    def _prune_failures(self, now: float) -> None:
+        for address in list(self.failures):
+            recent = [t for t in self.failures[address] if now - t < LOGIN_WINDOW]
+            if recent:
+                self.failures[address] = recent
+            else:
+                del self.failures[address]
+
+    def login(self, password: str, client_ip: str) -> tuple[str, str | None]:
+        """Check a password. Returns ("ok", token), ("denied", None) or ("throttled", None).
+
+        The attempt is reserved, counted as a failure, before the slow hash
+        runs, so parallel requests cannot all slip past the limit: an address
+        gets one check at a time and LOGIN_MAX_FAILURES per LOGIN_WINDOW, and
+        at most AUTH_CONCURRENCY checks run at once across all addresses.
+        """
         now = time.time()
         with self.lock:
-            recent = [t for t in self.failures.get(client_ip, []) if now - t < LOGIN_WINDOW]
-            self.failures[client_ip] = recent
-            if len(recent) >= LOGIN_MAX_FAILURES and now - recent[-1] < LOGIN_LOCK_SECONDS:
-                return None
-        if not self.core.verify_password(self.runtime.password_hash(), password):
+            self._prune_failures(now)
+            if client_ip in self.inflight or len(self.failures.get(client_ip, [])) >= LOGIN_MAX_FAILURES:
+                return "throttled", None
+            if not self.auth_slots.acquire(blocking=False):
+                return "throttled", None
+            self.inflight.add(client_ip)
+            self.failures.setdefault(client_ip, []).append(now)
+        try:
+            ok = self.core.verify_password(self.runtime.password_hash(), password)
+        finally:
             with self.lock:
-                self.failures.setdefault(client_ip, []).append(now)
-            return None
+                self.inflight.discard(client_ip)
+            self.auth_slots.release()
+        if not ok:
+            return "denied", None
         token = secrets.token_urlsafe(32)
         with self.lock:
             self.failures.pop(client_ip, None)
             self.sessions = {t: s for t, s in self.sessions.items() if s["expires"] > now}
             self.sessions[token] = {"csrf": secrets.token_urlsafe(32), "expires": now + SESSION_TTL}
-        return token
+        return "ok", token
 
     def session(self, token: str | None) -> dict[str, Any] | None:
         if not self.auth_required():
@@ -319,9 +344,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect("/")
         form = parse_qs(self.read_body().decode("utf-8", errors="replace"))
         password = (form.get("password") or [""])[0]
-        token = self.state.login(password, self.client_ip())
-        if token is None:
-            self.state.core.LOG.warning("Web UI login failed from %s", self.client_ip())
+        outcome, token = self.state.login(password, self.client_ip())
+        if outcome == "throttled" or token is None:
+            log = self.state.core.LOG.debug if outcome == "throttled" else self.state.core.LOG.warning
+            log("Web UI login %s from %s", "throttled" if outcome == "throttled" else "failed", self.client_ip())
             return self.redirect("/login?error=1")
         self.state.core.LOG.info("Web UI login from %s", self.client_ip())
         return self.redirect("/", self.cookie_header(token, SESSION_TTL))
@@ -386,6 +412,23 @@ def start(runtime: Any, core: Any) -> ThreadingHTTPServer | None:
             config.web_listen,
         )
         return None
+    if not is_loopback(host) and not config.web_tls_cert:
+        if not config.web_allow_insecure_lan:
+            core.LOG.error(
+                "Web UI not started: WEB_LISTEN=%s is reachable from the network but WEB_TLS_CERT "
+                "is not set, so the password and session cookie would cross the network "
+                "unencrypted. Set WEB_TLS_CERT and WEB_TLS_KEY, or bind to 127.0.0.1 and use an "
+                "SSH tunnel or an HTTPS reverse proxy, or set WEB_ALLOW_INSECURE_LAN=true to "
+                "accept the risk.",
+                config.web_listen,
+            )
+            return None
+        core.LOG.warning(
+            "Web UI is serving plain HTTP on %s (WEB_ALLOW_INSECURE_LAN=true): the password and "
+            "session cookie are not encrypted on the network",
+            config.web_listen,
+        )
+        state.insecure_transport = True
 
     class BoundHandler(Handler):
         pass
@@ -430,7 +473,7 @@ input,select{font:inherit;padding:6px 8px;border:1px solid var(--line);border-ra
 .ok{color:var(--ok)}.err{color:var(--err)}.warn{color:var(--warn)}.muted{color:var(--muted)}
 .mono{font-family:var(--mono);font-size:12px}
 .msg{margin:10px 0;padding:8px 12px;border-radius:6px;border:1px solid var(--line);background:var(--card)}
-.msg.err{border-color:var(--err)}.msg.ok{border-color:var(--ok)}
+.msg.err{border-color:var(--err)}.msg.ok{border-color:var(--ok)}.msg.warn{border-color:var(--warn)}
 """
 
 PAGE_CSS = r"""
@@ -619,6 +662,11 @@ PAGE_JS = r"""
   async function init() {
     const session = await api('/api/session'); S.csrf = session.csrf;
     $('#ver').textContent = 'v' + BOOT.version;
+    if (BOOT.insecure) {
+      const w = $('#transport-warning');
+      w.textContent = 'This page is served over plain HTTP: your password and session cookie cross the network unencrypted. Configure WEB_TLS_CERT and WEB_TLS_KEY to fix this (see the README, "TLS").';
+      w.hidden = false;
+    }
     $('#logout').hidden = !session.auth;
     document.querySelectorAll('nav [data-tab]').forEach(b => b.addEventListener('click', () => show(b.dataset.tab)));
     $('#sync-now').addEventListener('click', syncNow);
@@ -656,6 +704,7 @@ PAGE_HTML = r"""<!doctype html>
   <button class="ghost" id="logout" hidden>Sign out</button>
 </header>
 <main>
+  <div id="transport-warning" class="msg warn" hidden></div>
   <div id="global-msg"></div>
   <section id="tab-status">
     <div class="cards" id="status-cards"></div>
@@ -727,7 +776,11 @@ LOGIN_HTML = r"""<!doctype html>
 
 
 def render_page(state: WebState) -> str:
-    boot = json.dumps({"version": state.core.VERSION, "auth": state.auth_required()})
+    boot = json.dumps({
+        "version": state.core.VERSION,
+        "auth": state.auth_required(),
+        "insecure": state.insecure_transport,
+    })
     boot = boot.replace("</", "<\\/")
     return (
         PAGE_HTML.replace("__BASE_CSS__", BASE_CSS)
@@ -739,7 +792,7 @@ def render_page(state: WebState) -> str:
 
 def render_login(error: bool) -> str:
     notice = (
-        '<p class="err">Wrong password, or too many attempts. Wait a minute and try again.</p>'
+        '<p class="err">Wrong password, or too many attempts. Wait a few minutes and try again.</p>'
         if error else ""
     )
     return (

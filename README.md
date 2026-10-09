@@ -18,11 +18,12 @@ without touching a zone file by hand.
   contains manual records
 - Dry-run mode shows every change before you commit to anything
 
-**Status:** v1.4.0. In production since July 2026 on a Proxmox LXC, syncing
+**Status:** v1.5.0. In production since July 2026 on a Proxmox LXC, syncing
 roughly 100 UniFi clients into about 80 managed records every 5 minutes.
 1.3.0 fixed the record churn described in
-[Code review notes](#code-review-notes-october-2026); 1.4.0 added the
-[Web UI](#web-ui). See the [Changelog](#changelog) for release history.
+[Code review notes](#code-review-notes-october-2026), 1.4.0 added the
+[Web UI](#web-ui), and 1.5.0 fixes the findings of an October 2026 security
+review. See the [Changelog](#changelog) for release history.
 
 ## Contents
 
@@ -60,9 +61,13 @@ synchronization cycle:
    are labels in `EXCLUDED_NAMES` and addresses outside `ALLOWED_NETWORKS`.
 4. **De-duplicate**: if two or more *remembered* clients (online, or seen
    within `NAME_MEMORY_TTL`) share a label, each gets a suffix from the last
-   six hex digits of its MAC (`iphone-a1b2c3.home.arpa`). Because offline
-   namesakes count, a device's name does not change when its twin comes and
-   goes.
+   six hex digits of its MAC (`iphone-a1b2c3.home.arpa`), or more digits when
+   two of those MACs end the same way. Because offline namesakes count, a
+   device's name does not change when its twin comes and goes. A client keeps
+   the exact name it already holds, so a newcomer that copies its hostname,
+   the end of its MAC, or even its full suffixed name gets a different name
+   instead of taking that one over. Names are always unique; a record is never
+   silently replaced. MACs that are not 12 hex digits get no naming memory.
 5. **Fetch the zone** from Technitium and compute the difference.
 6. **Apply changes** (see "What it modifies" below).
 7. **Save state** to `STATE_FILE` — a JSON file recording which records the
@@ -106,7 +111,7 @@ The service only ever creates or deletes **`A` records inside the configured
 | Situation | Action |
 |---|---|
 | New client appears | `A` record added, tagged with the comment `managed-by=unifi-technitium-sync` |
-| Client's IP changes | Old `A` record deleted and a new one added — but only after the new IP has been reported for `IP_STABLE_POLLS` consecutive cycles (default 2), which suppresses churn from clients whose reported IP flaps |
+| Client's IP changes | New `A` record added first, then the old one deleted, so a failure in between never leaves the name unresolvable. Applied only after the new IP has been reported for `IP_STABLE_POLLS` consecutive cycles (default 2), which suppresses churn from clients whose reported IP flaps |
 | Client's chosen label changes durably (see "How names are chosen") | The record under the old name is deleted and a record under the new name is created in the same cycle (matched by MAC) |
 | Client disappears (powered off, roaming) | Record is kept for `STALE_AFTER` seconds (default 24 h), then deleted |
 | A record with the same name already exists **without** the marker comment | Skipped, warning logged once — manual records always win |
@@ -260,6 +265,7 @@ repository; only `unifi-technitium-sync.env.example` is tracked.
 | `WEB_LISTEN` | empty | `host:port` for the built-in web UI, e.g. `0.0.0.0:8089`; empty keeps it off. Needs a restart |
 | `WEB_PASSWORD_HASH` | empty | Written by `--set-web-password` or the UI's password form; never edit by hand |
 | `WEB_TLS_CERT` / `WEB_TLS_KEY` | unset | PEM certificate chain and key to serve the UI over HTTPS; the service loads but never creates them (see [TLS](#tls)). Needs a restart |
+| `WEB_ALLOW_INSECURE_LAN` | `false` | Without TLS the UI only starts on a loopback address. `true` allows plain HTTP on a network address, sending the password and session cookie unencrypted, and puts a warning banner on every page. Needs a restart |
 
 ## Reverse DNS (PTR records)
 
@@ -273,6 +279,12 @@ lookups (`dig -x 192.168.1.50`) return the device name:
   matching PTR is deleted too. Technitium's delete API does not cascade to
   the reverse zone on its own, so the service removes the PTR explicitly —
   filtered by name, so a PTR that already points somewhere else is left alone.
+- If a PTR deletion fails for a transient reason (timeout, HTTP error,
+  Technitium unreachable), it is kept in the state file and retried every
+  cycle, even when the cycle that failed did not complete. It shows under
+  "Deferred changes" in the web UI. A queued deletion is dropped as soon as
+  that name points at that address again, and abandoned with a warning after
+  7 days. A refusal from Technitium (no such zone or record) is not retried.
 - Enabling PTR on an existing installation only affects records created from
   then on. Create PTRs for everything already managed with a one-time backfill:
 
@@ -298,9 +310,18 @@ process. It stays off until `WEB_LISTEN` is set.
      --config /etc/unifi-technitium-sync/sync.env --set-web-password
    ```
 
-2. Set `WEB_LISTEN=0.0.0.0:8089` (or one LAN address) in `sync.env` and run
-   `sudo systemctl restart unifi-technitium-sync`.
-3. Open `http://<host>:8089/` and sign in.
+2. Choose how to reach it, set `WEB_LISTEN` in `sync.env`, and run
+   `sudo systemctl restart unifi-technitium-sync`:
+   - **HTTPS on the LAN** (recommended): `WEB_LISTEN=0.0.0.0:8089` plus
+     `WEB_TLS_CERT` and `WEB_TLS_KEY` (see [TLS](#tls)). Open
+     `https://<host>:8089/`.
+   - **Loopback only**: `WEB_LISTEN=127.0.0.1:8089`, then
+     `ssh -L 8089:127.0.0.1:8089 <host>` and open `http://localhost:8089/`,
+     or put an HTTPS reverse proxy on the same host in front of it.
+   - **Plain HTTP on the LAN**: refused unless you also set
+     `WEB_ALLOW_INSECURE_LAN=true`, because the password and session cookie
+     would cross the network unencrypted. Every page then shows a warning.
+3. Sign in.
 
 | Tab | What it shows |
 |---|---|
@@ -313,13 +334,20 @@ How it is secured:
 
 - The password is stored as a PBKDF2-SHA256 hash (200 000 iterations) in
   `sync.env`. Sessions are HttpOnly, SameSite=Strict cookies that expire after
-  12 hours; every write request also needs the session's CSRF token. Five
-  failed logins from one address lock that address out for a minute.
+  12 hours; every write request also needs the session's CSRF token.
+- Password guessing is throttled before the slow hash runs, so parallel
+  requests cannot slip past the limit: each address gets one attempt at a
+  time and at most five failed attempts per five minutes, and no more than two
+  password checks run at once across all addresses. Behind a reverse proxy
+  every client shares the proxy's address and therefore one limit.
 - Without a password the UI refuses to start on anything but a loopback
   address. Reach a loopback-only UI with `ssh -L 8089:127.0.0.1:8089 <host>`.
 - The response headers set a strict Content-Security-Policy, `X-Frame-Options:
   DENY` and `Cache-Control: no-store`.
-- HTTPS is optional and off by default; see [TLS](#tls) below.
+- Plain HTTP is only allowed on a loopback address unless you opt in with
+  `WEB_ALLOW_INSECURE_LAN=true`; see [TLS](#tls) below. The UI does not send
+  HSTS, because that would make browsers refuse a self-signed certificate
+  outright.
 - Anyone who can sign in can read device names and change where the API
   tokens are sent, so bind the UI to a management VLAN or loopback where you
   can. The installer makes `sync.env` group-writable by the service user
@@ -399,6 +427,8 @@ certificate).
 | `Configuration error: …` on start | A required variable is missing or invalid in `sync.env`. |
 | `Web UI not started: WEB_LISTEN=… no WEB_PASSWORD_HASH is set` | Set a password with `--set-web-password`, or bind to `127.0.0.1`. The sync keeps running without the UI. |
 | `Web UI could not start on …: Address already in use` | Another program owns that port; change `WEB_LISTEN` and restart. |
+| `Web UI not started: WEB_LISTEN=… is reachable from the network but WEB_TLS_CERT is not set` | Plain HTTP on a network address is refused. Configure [TLS](#tls), bind to `127.0.0.1` and use an SSH tunnel or a reverse proxy, or set `WEB_ALLOW_INSECURE_LAN=true` to accept unencrypted logins. The sync itself keeps running. |
+| `Could not delete the PTR … will retry on later cycles` | Technitium did not answer the PTR deletion; it is queued in the state file and retried each cycle for up to 7 days. |
 | `Web UI could not start on …: [Errno 13]` / `No such file` / `[SSL]` | `WEB_TLS_CERT` or `WEB_TLS_KEY` is missing, unreadable by the `unifi-dns-sync` user, or the key does not match the certificate. See [TLS](#tls). The sync itself keeps running. |
 | `Synchronization failed` + traceback | One cycle failed (usually a timeout or an unreachable API). The service retries on the next interval; state is not written for a failed cycle. |
 
@@ -610,6 +640,11 @@ file path as `CONFIG_FILE` instead of loading it with `EnvironmentFile=`.
 Rerun `sudo ./install.sh`, then restart. The web UI stays off until you set
 `WEB_LISTEN`.
 
+Upgrading to 1.5.0: if the UI listens on a network address without TLS, it no
+longer starts (the journal says why). Configure `WEB_TLS_CERT` and
+`WEB_TLS_KEY`, or set `WEB_ALLOW_INSECURE_LAN=true` to keep plain HTTP. The
+state file gains a `ptr_cleanup` list automatically; nothing else changes.
+
 ## Removal
 
 ```sh
@@ -621,6 +656,18 @@ identifiable in Technitium by the `managed-by=unifi-technitium-sync` comment.
 
 ## Changelog
 
+- **1.5.0** (2026-10-09) — Fixes from a Codex code and security review.
+  Login throttling can no longer be bypassed with parallel requests: attempts
+  are reserved before the password hash runs, one per address at a time, five
+  failures per five minutes, at most two hashes at once. Plain HTTP on a
+  network address is refused unless `WEB_ALLOW_INSECURE_LAN=true`, and then
+  every page shows a warning. Clients whose MACs end in the same six hex
+  digits get longer suffixes instead of one record silently replacing the
+  other; clients keep the name they hold, so a newcomer cannot take it over;
+  MACs that are not 12 hex digits get no naming memory. IP changes add the new
+  record before deleting the old one. PTR deletions that fail transiently are
+  queued in the state file and retried for up to 7 days, even when the cycle
+  fails. 63 tests.
 - **1.4.0** (2026-10-09) — Built-in web UI (`WEB_LISTEN`, `WEB_TLS_*`,
   `--set-web-password`): status, records with naming memory, settings editor
   with validation and live apply, dry-run preview, log tail. Naming rule

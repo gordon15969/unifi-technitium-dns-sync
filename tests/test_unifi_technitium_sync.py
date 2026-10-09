@@ -6,6 +6,7 @@ Run with:  python3 -m unittest discover -s tests -v
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import json
 import logging
 import sys
@@ -59,6 +60,7 @@ def make_config(state_file: Path, **overrides) -> "uts.Config":
         web_password_hash="",
         web_tls_cert=None,
         web_tls_key=None,
+        web_allow_insecure_lan=False,
     )
     values.update(overrides)
     return uts.Config(**values)
@@ -96,6 +98,7 @@ class FakeTechnitium:
         self.zone: list[dict] = [dict(r) for r in records or []]
         self.log: list[tuple[str, str, str]] = []
         self.actions: list[dict[str, str]] = []  # same interface as TechnitiumClient
+        self.ptr_failures: list[dict[str, str]] = []
         self.dry_run = False
 
     def records(self) -> list[dict]:
@@ -118,6 +121,9 @@ class FakeTechnitium:
         self.zone = [
             r for r in self.zone if not (r["name"] == name and r["rData"]["ipAddress"] == address)
         ]
+
+    def delete_ptr(self, name: str, address: str, queue: bool = True) -> bool:
+        return True
 
 
 class Harness:
@@ -211,7 +217,7 @@ class MigrationTests(unittest.TestCase):
     def test_load_state_missing_file(self):
         with tempfile.TemporaryDirectory() as d:
             state = uts.load_state(Path(d) / "none.json", ZONE)
-        self.assertEqual(state, {"version": 2, "managed_records": {}, "pending": {}, "clients": {}})
+        self.assertEqual(state, {"version": 2, "managed_records": {}, "pending": {}, "clients": {}, "ptr_cleanup": []})
 
 
 class FlipRegressionTests(unittest.TestCase):
@@ -520,6 +526,240 @@ class UpgradeAndSafetyTests(unittest.TestCase):
         self.assertEqual(set(h.state()["clients"]), {"aa000000000d"})
         h.close()
 
+
+
+def rev(address: str) -> str:
+    return ipaddress.ip_address(address).reverse_pointer
+
+
+class RecordingTechnitium(uts.TechnitiumClient):
+    """The real Technitium client with only its HTTP layer replaced by an in-memory zone.
+
+    fail maps (operation, record type), e.g. ("delete", "PTR"), to a list of
+    outcomes for successive matching calls: an exception to raise, or None to
+    let that call succeed.
+    """
+
+    def __init__(self, config):
+        super().__init__(config, dry_run=False)
+        self.zone: list[dict] = []
+        self.ptrs: dict[str, str] = {}
+        self.calls: list[tuple[str, str, str, str]] = []
+        self.fail: dict[tuple[str, str], list] = {}
+
+    def _call(self, path, params):
+        op = path.rsplit("/", 1)[-1]
+        rtype = str(params.get("type", ""))
+        pending = self.fail.get((op, rtype))
+        if pending:
+            outcome = pending.pop(0)
+            if outcome is not None:
+                raise outcome
+        if op == "get":
+            return {"status": "ok", "response": {"records": [dict(r) for r in self.zone]}}
+        if op == "add":
+            domain, address = params["domain"], params["ipAddress"]
+            self.calls.append(("ADD", "A", domain, address))
+            self.zone.append(managed(domain[: -len(ZONE) - 1], address))
+            if params.get("ptr"):
+                self.ptrs[rev(address)] = domain
+        elif op == "delete" and rtype == "A":
+            domain, address = params["domain"], params["ipAddress"]
+            self.calls.append(("DELETE", "A", domain, address))
+            self.zone = [r for r in self.zone if not (r["name"] == domain and r["rData"]["ipAddress"] == address)]
+        elif op == "delete" and rtype == "PTR":
+            reverse, target = params["domain"], params["ptrName"]
+            self.calls.append(("DELETE", "PTR", reverse, target))
+            if self.ptrs.get(reverse) != target:
+                return {"status": "error", "errorMessage": "No such record"}
+            del self.ptrs[reverse]
+        return {"status": "ok"}
+
+    def addresses(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for record in self.zone:
+            out.setdefault(record["name"], []).append(record["rData"]["ipAddress"])
+        return {name: sorted(ips) for name, ips in out.items()}
+
+
+class LiveHarness:
+    """synchronize() against RecordingTechnitium, with PTRs on and IP changes applied at once."""
+
+    def __init__(self, **cfg):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = make_config(Path(self.tmp.name) / "state.json", create_ptr=True, ip_stable_polls=1, **cfg)
+        self.tech = RecordingTechnitium(self.cfg)
+        self.now = 1_000_000
+
+    def run(self, poll: list[dict], advance: int = STEP) -> list[tuple]:
+        self.now += advance
+        start = len(self.tech.calls)
+        try:
+            uts.synchronize(self.cfg, FakeUnifi(poll), self.tech, False, now=self.now)
+        finally:
+            self.last_calls = self.tech.calls[start:]
+        return self.last_calls
+
+    def state(self) -> dict:
+        return json.loads(self.cfg.state_file.read_text())
+
+    def close(self) -> None:
+        self.tmp.cleanup()
+
+
+class CollisionTests(unittest.TestCase):
+    """Two clients must never be given the same name (security review, High)."""
+
+    VICTIM, OTHER, ATTACKER = "001122abcdef", "0011220000aa", "ffeeddabcdef"
+
+    def zone(self, h):
+        return {r["name"]: r["rData"]["ipAddress"] for r in h.tech.zone}
+
+    def test_shared_mac_tail_gets_a_longer_suffix_and_the_victim_keeps_its_name(self):
+        h = Harness()
+        victim = client(self.VICTIM, "10.0.0.10", hostname="camera")
+        other = client(self.OTHER, "10.0.0.11", hostname="camera")
+        attacker = client(self.ATTACKER, "10.0.0.66", hostname="camera")
+        h.run([victim, other])
+        self.assertEqual(h.names(), [fqdn("camera-0000aa"), fqdn("camera-abcdef")])
+        self.assertEqual(h.run([attacker, other, victim]), [("ADD", fqdn("camera-ddabcdef"), "10.0.0.66")])
+        self.assertEqual(h.run([victim, other, attacker]), [], "UniFi response order must not matter")
+        self.assertEqual(self.zone(h)[fqdn("camera-abcdef")], "10.0.0.10")
+        h.close()
+
+    def test_copying_a_suffixed_name_as_hostname_cannot_take_it_over(self):
+        h = Harness()
+        victim = client(self.VICTIM, "10.0.0.10", hostname="camera")
+        other = client(self.OTHER, "10.0.0.11", hostname="camera")
+        h.run([victim, other])
+        impostor = client("aabbcc000001", "10.0.0.66", hostname="camera-abcdef")
+        self.assertEqual(h.run([impostor, victim, other]), [("ADD", fqdn("camera-abcdef-000001"), "10.0.0.66")])
+        self.assertEqual(self.zone(h)[fqdn("camera-abcdef")], "10.0.0.10")
+        h.close()
+
+    def test_new_clients_sharing_a_mac_tail_both_get_records(self):
+        h = Harness()
+        a = client(self.VICTIM, "10.0.0.10", hostname="camera")
+        b = client(self.ATTACKER, "10.0.0.66", hostname="camera")
+        log = h.run([b, a])
+        self.assertEqual(sorted(log), sorted([("ADD", fqdn("camera-abcdef"), "10.0.0.10"),
+                                              ("ADD", fqdn("camera-ddabcdef"), "10.0.0.66")]))
+        self.assertEqual(h.run([a, b]), [])
+        h.close()
+
+    def test_record_labels_are_unique_after_assignment(self):
+        cfg = make_config(Path("/nonexistent/state.json"))
+        clients = [client(f"{p}00abcdef", f"10.0.1.{i}", hostname="cam") for i, p in enumerate(["aa11", "bb11", "cc11", "aa22"], 1)]
+        desired, memory = uts.desired_records(cfg, clients, {}, 1_000_000)
+        self.assertEqual(len(desired), 4)
+        self.assertEqual(len({uts.record_label(e["label"], e["suffix"]) for e in memory.values()}), 4)
+
+    def test_malformed_mac_gets_no_naming_memory(self):
+        self.assertEqual(uts.client_mac({"mac": "AA:BB:CC:DD:EE:FF"}), "aabbccddeeff")
+        self.assertEqual(uts.client_mac({"mac": "aabb.ccdd.eeff"}), "aabbccddeeff")
+        for bad in ("aa:bb:cc", "zz:zz:zz:zz:zz:zz", "aa:bb:cc:dd:ee:ff:00", "g0:11:22:33:44:55"):
+            self.assertEqual(uts.client_mac({"mac": bad}), "", bad)
+        h = Harness()
+        h.run([{"mac": "aa:bb:cc", "ip": "10.0.0.5", "hostname": "odd"}])
+        self.assertEqual(h.state()["clients"], {})
+        self.assertEqual(h.names(), [fqdn("odd")])
+        h.close()
+
+
+class IpChangeOrderTests(unittest.TestCase):
+    """An IP change must never leave the name without a record (code review, Medium)."""
+
+    MAC = "aa00000000f1"
+
+    def test_new_address_is_added_before_the_old_one_is_deleted(self):
+        h = LiveHarness()
+        h.run([client(self.MAC, "10.0.1.10", name="nas")])
+        calls = h.run([client(self.MAC, "10.0.1.20", name="nas")])
+        self.assertEqual(calls, [
+            ("ADD", "A", fqdn("nas"), "10.0.1.20"),
+            ("DELETE", "A", fqdn("nas"), "10.0.1.10"),
+            ("DELETE", "PTR", rev("10.0.1.10"), fqdn("nas")),
+        ])
+        h.close()
+
+    def test_failed_add_leaves_the_old_record_in_place(self):
+        h = LiveHarness()
+        h.run([client(self.MAC, "10.0.1.10", name="nas")])
+        h.tech.fail[("add", "A")] = [uts.TransportError("timed out")]
+        with self.assertRaises(uts.TransportError):
+            h.run([client(self.MAC, "10.0.1.20", name="nas")])
+        self.assertEqual(h.tech.addresses(), {fqdn("nas"): ["10.0.1.10"]})
+        h.run([client(self.MAC, "10.0.1.20", name="nas")])
+        self.assertEqual(h.tech.addresses(), {fqdn("nas"): ["10.0.1.20"]})
+        h.close()
+
+
+class PtrRetryTests(unittest.TestCase):
+    """A PTR deletion that fails for a transient reason must be retried (code review, Medium)."""
+
+    MAC = "aa00000000f2"
+
+    def nas(self, address):
+        return [client(self.MAC, address, name="nas")]
+
+    def test_transient_failure_is_queued_and_retried(self):
+        h = LiveHarness()
+        h.run(self.nas("10.0.1.10"))
+        h.tech.fail[("delete", "PTR")] = [uts.TransportError("HTTP 500")]
+        h.run(self.nas("10.0.1.20"))
+        self.assertEqual([(q["fqdn"], q["address"]) for q in h.state()["ptr_cleanup"]], [(fqdn("nas"), "10.0.1.10")])
+        self.assertIn(rev("10.0.1.10"), h.tech.ptrs)
+        self.assertEqual(h.run(self.nas("10.0.1.20")), [("DELETE", "PTR", rev("10.0.1.10"), fqdn("nas"))])
+        self.assertEqual(h.state()["ptr_cleanup"], [])
+        self.assertEqual(h.tech.ptrs, {rev("10.0.1.20"): fqdn("nas")})
+        h.close()
+
+    def test_api_refusal_is_not_retried(self):
+        h = LiveHarness()
+        h.run(self.nas("10.0.1.10"))
+        h.tech.ptrs.clear()  # already gone, so Technitium refuses the delete
+        h.run(self.nas("10.0.1.20"))
+        self.assertEqual(h.state()["ptr_cleanup"], [])
+        h.close()
+
+    def test_queued_deletion_is_dropped_when_the_address_is_current_again(self):
+        h = LiveHarness()
+        h.run(self.nas("10.0.1.10"))
+        h.tech.fail[("delete", "PTR")] = [uts.TransportError("HTTP 500")]
+        h.run(self.nas("10.0.1.20"))
+        calls = h.run(self.nas("10.0.1.10"))
+        self.assertNotIn(("DELETE", "PTR", rev("10.0.1.10"), fqdn("nas")), calls)
+        self.assertEqual(h.tech.ptrs.get(rev("10.0.1.10")), fqdn("nas"))
+        self.assertEqual(h.state()["ptr_cleanup"], [])
+        h.close()
+
+    def test_failure_is_recorded_even_when_the_cycle_fails(self):
+        h = LiveHarness()
+        alpha, bravo = "aa00000000a1", "aa00000000b2"
+        h.run([client(alpha, "10.0.1.10", name="alpha")])
+        h.tech.fail[("delete", "PTR")] = [uts.TransportError("HTTP 500")]
+        h.tech.fail[("add", "A")] = [None, uts.TransportError("timed out")]
+        poll = [client(alpha, "10.0.1.20", name="alpha"), client(bravo, "10.0.1.30", name="bravo")]
+        with self.assertRaises(uts.TransportError):
+            h.run(poll)
+        state = h.state()
+        self.assertEqual([(q["fqdn"], q["address"]) for q in state["ptr_cleanup"]], [(fqdn("alpha"), "10.0.1.10")])
+        self.assertEqual(state["managed_records"][fqdn("alpha")]["ip"], "10.0.1.10", "the rest of the failed cycle is not saved")
+        h.run(poll)
+        self.assertEqual(h.state()["ptr_cleanup"], [])
+        self.assertNotIn(rev("10.0.1.10"), h.tech.ptrs)
+        self.assertEqual(h.tech.addresses(), {fqdn("alpha"): ["10.0.1.20"], fqdn("bravo"): ["10.0.1.30"]})
+        h.close()
+
+    def test_queue_entries_expire(self):
+        h = LiveHarness()
+        h.run(self.nas("10.0.1.20"))
+        state = h.state()
+        state["ptr_cleanup"] = [{"fqdn": fqdn("old"), "address": "10.0.1.99", "since": h.now - uts.PTR_RETRY_MAX_AGE, "attempts": 40}]
+        h.cfg.state_file.write_text(json.dumps(state))
+        self.assertEqual(h.run(self.nas("10.0.1.20"), advance=1), [])
+        self.assertEqual(h.state()["ptr_cleanup"], [])
+        h.close()
 
 if __name__ == "__main__":
     unittest.main()

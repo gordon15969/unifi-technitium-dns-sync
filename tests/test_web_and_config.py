@@ -11,6 +11,9 @@ import json
 import logging
 import sys
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from urllib.parse import urlencode
@@ -320,6 +323,134 @@ class WebServerTests(unittest.TestCase):
         self.login("newpassword2")
         self.assertTrue(uts.verify_password(uts.read_env_file(self.env_path)["WEB_PASSWORD_HASH"], "newpassword2"))
 
+
+
+class SlowCore:
+    """Stands in for the daemon module: a password check that takes a while."""
+
+    def __init__(self, delay: float = 0.5):
+        self.delay, self.calls, self.active, self.max_active = delay, 0, 0, 0
+        self.guard = threading.Lock()
+
+    def verify_password(self, stored: str, password: str) -> bool:
+        with self.guard:
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(self.delay)
+        with self.guard:
+            self.active -= 1
+        return password == "right"
+
+
+class StubRuntime:
+    def password_hash(self) -> str:
+        return "stored-hash"
+
+    def current_config(self):
+        return SimpleNamespace(web_tls_cert=None)
+
+
+def burst(state, attempts):
+    """Start every (password, address) attempt at the same moment; return the outcomes."""
+    barrier = threading.Barrier(len(attempts))
+    results = [None] * len(attempts)
+
+    def go(i, password, address):
+        barrier.wait()
+        results[i] = state.login(password, address)[0]
+
+    threads = [threading.Thread(target=go, args=(i, pw, ip)) for i, (pw, ip) in enumerate(attempts)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    return results
+
+
+class LoginThrottleTests(unittest.TestCase):
+    """Parallel guessing must not bypass the limit (security review, High)."""
+
+    def test_parallel_guesses_from_one_address_get_one_password_check(self):
+        core = SlowCore()
+        state = web.WebState(StubRuntime(), core)
+        results = burst(state, [("wrong", "10.9.9.9")] * 25)
+        self.assertEqual(core.calls, 1)
+        self.assertEqual(results.count("denied"), 1)
+        self.assertEqual(results.count("throttled"), 24)
+
+    def test_limit_per_address_then_no_more_password_checks(self):
+        core = SlowCore(delay=0)
+        state = web.WebState(StubRuntime(), core)
+        outcomes = [state.login("wrong", "10.9.9.9")[0] for _ in range(8)]
+        self.assertEqual(outcomes, ["denied"] * web.LOGIN_MAX_FAILURES + ["throttled"] * 3)
+        self.assertEqual(core.calls, web.LOGIN_MAX_FAILURES)
+        self.assertEqual(state.login("right", "10.9.9.9")[0], "throttled", "even the right password waits")
+        self.assertEqual(state.login("right", "10.9.9.10")[0], "ok", "other addresses are unaffected")
+
+    def test_success_resets_and_old_failures_expire(self):
+        core = SlowCore(delay=0)
+        state = web.WebState(StubRuntime(), core)
+        for _ in range(web.LOGIN_MAX_FAILURES - 1):
+            state.login("wrong", "10.9.9.9")
+        outcome, token = state.login("right", "10.9.9.9")
+        self.assertEqual(outcome, "ok")
+        self.assertTrue(token)
+        self.assertNotIn("10.9.9.9", state.failures)
+        for _ in range(web.LOGIN_MAX_FAILURES):
+            state.login("wrong", "10.9.9.8")
+        self.assertEqual(state.login("wrong", "10.9.9.8")[0], "throttled")
+        state.failures["10.9.9.8"] = [t - web.LOGIN_WINDOW for t in state.failures["10.9.9.8"]]
+        self.assertEqual(state.login("wrong", "10.9.9.8")[0], "denied")
+        self.assertEqual(len(state.failures["10.9.9.8"]), 1, "expired failures are pruned")
+
+    def test_password_checks_are_capped_across_addresses(self):
+        core = SlowCore()
+        state = web.WebState(StubRuntime(), core)
+        results = burst(state, [("wrong", f"10.9.8.{i}") for i in range(12)])
+        self.assertLessEqual(core.max_active, web.AUTH_CONCURRENCY)
+        self.assertLess(core.calls, 12)
+        self.assertEqual(results.count("denied"), core.calls)
+        self.assertEqual(results.count("throttled"), 12 - core.calls)
+
+
+class InsecureTransportTests(unittest.TestCase):
+    """Plain HTTP on a network address needs an explicit opt-in (security review, High)."""
+
+    def runtime(self, d, **extra):
+        env = {"WEB_LISTEN": "0.0.0.0:0", "WEB_PASSWORD_HASH": uts.hash_password("pw123456", iterations=1000)}
+        env.update(extra)
+        return make_runtime(Path(d), [], env)[0]
+
+    def test_network_address_without_tls_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(web.start(self.runtime(d), uts))
+
+    def test_explicit_override_starts_and_warns_on_the_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            server = web.start(self.runtime(d, WEB_ALLOW_INSECURE_LAN="true"), uts)
+            self.assertIsNotNone(server)
+            try:
+                state = server.RequestHandlerClass.state
+                self.assertTrue(state.insecure_transport)
+                self.assertIn('"insecure": true', web.render_page(state))
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+                conn.request("GET", "/login")
+                self.assertEqual(conn.getresponse().status, 200)
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_loopback_is_not_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            server = web.start(self.runtime(d, WEB_LISTEN="127.0.0.1:0"), uts)
+            try:
+                self.assertFalse(server.RequestHandlerClass.state.insecure_transport)
+                self.assertIn('"insecure": false', web.render_page(server.RequestHandlerClass.state))
+            finally:
+                server.shutdown()
+                server.server_close()
 
 if __name__ == "__main__":
     unittest.main()
