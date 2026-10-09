@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 MARKER = "managed-by=unifi-technitium-sync"
 STOP = False
 WAKE = threading.Event()
