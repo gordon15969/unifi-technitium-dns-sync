@@ -325,10 +325,17 @@ def parse_env_value(raw: str) -> str:
     return value
 
 
+def read_locked(path: Path) -> str:
+    """Read a settings file under a shared lock, so an in-place rewrite is never seen half done."""
+    with path.open(encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_SH)
+        return handle.read()
+
+
 def read_env_file(path: Path) -> dict[str, str]:
     """Parse a KEY=VALUE file of the kind systemd's EnvironmentFile= reads."""
     values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_locked(path).splitlines():
         match = ENV_LINE.match(line)
         if match:
             values[match.group(1)] = parse_env_value(match.group(2))
@@ -342,36 +349,98 @@ def format_env_value(value: str) -> str:
 
 
 def write_env_file(path: Path, updates: Mapping[str, str]) -> None:
-    """Rewrite KEY=VALUE lines in place, keeping comments and order; append new keys."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        original: os.stat_result | None = path.stat()
-    except FileNotFoundError:
-        lines, original = [], None
-    remaining = dict(updates)
-    output: list[str] = []
-    for line in lines:
-        match = ENV_LINE.match(line)
-        if match and match.group(1) in remaining:
-            key = match.group(1)
-            output.append(f"{key}={format_env_value(remaining.pop(key))}")
-        else:
-            output.append(line)
-    if remaining:
-        if output and output[-1].strip():
-            output.append("")
-        output.append("# Added by the web UI")
-        output.extend(f"{key}={format_env_value(value)}" for key, value in remaining.items())
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text("\n".join(output) + "\n", encoding="utf-8")
-    os.chmod(temporary, original.st_mode & 0o777 if original else 0o640)
-    if original is not None:
+    """Rewrite KEY=VALUE lines, keeping comments, order, mode, owner and group; append new keys.
+
+    The new text always goes to PATH.tmp first. If that copy can be given the
+    original owner and group (the writer is root, or already owns the file), it
+    replaces PATH atomically. Otherwise, as when the service user saves the
+    root-owned file from the web UI, the text is copied into the existing file,
+    which keeps its inode and with it the owner. PATH.tmp is removed only after
+    that copy succeeds, so an interrupted save leaves the complete new file there.
+    """
+    with settings_lock(path):  # re-entrant: callers usually hold it already
         try:
-            # Keep owner and group (root edits must stay readable by the service user).
-            os.chown(temporary, original.st_uid, original.st_gid)
-        except PermissionError:
-            pass  # not root: the file stays owned by the writing user, which can read it
-    os.replace(temporary, path)
+            lines = read_locked(path).splitlines()
+            original: os.stat_result | None = path.stat()
+        except FileNotFoundError:
+            lines, original = [], None
+        remaining = dict(updates)
+        output: list[str] = []
+        for line in lines:
+            match = ENV_LINE.match(line)
+            if match and match.group(1) in remaining:
+                key = match.group(1)
+                output.append(f"{key}={format_env_value(remaining.pop(key))}")
+            else:
+                output.append(line)
+        if remaining:
+            if output and output[-1].strip():
+                output.append("")
+            output.append("# Added by the web UI")
+            output.extend(f"{key}={format_env_value(value)}" for key, value in remaining.items())
+        data = ("\n".join(output) + "\n").encode("utf-8")
+        temporary = path.with_name(path.name + ".tmp")
+        stage_copy(temporary, data, original.st_mode & 0o777 if original else 0o640)
+        try:
+            if original is None or chown_like(temporary, original):
+                os.replace(temporary, path)
+                return
+            fsync_directory(path.parent)  # the complete copy must be on disk before PATH changes
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        # The writer cannot hand a new file to the owner (the service user saving the
+        # root-owned file), so copy into the existing one. If that fails, PATH.tmp stays.
+        overwrite_in_place(path, data)
+        temporary.unlink()
+
+
+def stage_copy(path: Path, data: bytes, mode: int) -> None:
+    """Create PATH, which must not exist, holding DATA with MODE and flushed to disk."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise FileExistsError(
+            f"{path} already exists: another save is running, or an earlier one was interrupted "
+            f"and that file may be the only complete copy of the settings. Compare it with "
+            f"{path.with_suffix('').name}, keep the right one and delete {path.name}."
+        ) from None
+    try:
+        with open(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def chown_like(path: Path, original: os.stat_result) -> bool:
+    """Give PATH the owner and group of ORIGINAL; False when this user is not allowed to."""
+    try:
+        os.chown(path, original.st_uid, original.st_gid)
+    except PermissionError:
+        return False
+    return True
+
+
+def overwrite_in_place(path: Path, data: bytes) -> None:
+    """Replace PATH's contents without replacing the file, so owner, group and mode stay."""
+    with path.open("r+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)  # readers take LOCK_SH (read_locked)
+        handle.write(data)
+        handle.flush()
+        handle.truncate(len(data))
+        os.fsync(handle.fileno())
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 SETTINGS_LOCK = threading.RLock()
@@ -1775,8 +1844,12 @@ def set_web_password(config_path: Path | None) -> int:
     if len(password) < 8:
         print("Password must be at least 8 characters.", file=sys.stderr)
         return 2
-    with settings_lock(config_path):
-        write_env_file(config_path, {"WEB_PASSWORD_HASH": hash_password(password)})
+    try:
+        with settings_lock(config_path):
+            write_env_file(config_path, {"WEB_PASSWORD_HASH": hash_password(password)})
+    except OSError as exc:
+        print(f"Could not write {config_path}: {exc}", file=sys.stderr)
+        return 1
     print(f"Password hash written to {config_path}. A running web UI uses it for the next login; "
           "set WEB_LISTEN and restart the service if the UI is not enabled yet.")
     return 0
@@ -1851,6 +1924,10 @@ def main() -> int:
         LOG.warning("UNIFI_VERIFY_TLS=false; TLS certificate verification is disabled")
     if not config.technitium_verify_tls:
         LOG.warning("TECHNITIUM_VERIFY_TLS=false; TLS certificate verification is disabled")
+    if config_path is not None and config_path.with_name(config_path.name + ".tmp").exists():
+        LOG.warning("%s.tmp is left over from an interrupted settings save and blocks further saves; "
+                    "compare it with %s, keep the right one and delete the .tmp file",
+                    config_path, config_path)
 
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)

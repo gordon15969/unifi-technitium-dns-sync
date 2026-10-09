@@ -345,7 +345,7 @@ process. It stays off until `WEB_LISTEN` is set.
 |---|---|
 | **Status** | Last and next cycle, duration, client/record counts, writes in the last cycle, skipped and deferred changes, the last 50 cycles. **Sync now** runs a cycle immediately; **Dry-run preview** lists every change a cycle would make without writing anything |
 | **Records** | Every managed record with its IP, MAC, last-seen time and naming memory (which field named it, de-dup suffix, pending IP change or rename), with a filter box |
-| **Settings** | Every setting from the configuration reference with help text, grouped by section. Secrets are write-only (shown as set/not set). **Save** validates the whole configuration first, writes `sync.env` atomically (comments and order preserved) and applies from the next cycle; `WEB_*` settings say when a restart is needed. A password form is at the bottom |
+| **Settings** | Every setting from the configuration reference with help text, grouped by section. Secrets are write-only (shown as set/not set). **Save** validates the whole configuration first, writes `sync.env` with comments, order, owner and mode preserved (see "How it is secured" below) and applies from the next cycle; `WEB_*` settings say when a restart is needed. A password form is at the bottom |
 | **Log** | The last 400 log lines, auto-refreshing |
 
 How it is secured:
@@ -383,7 +383,15 @@ How it is secured:
   tokens are sent, so bind the UI to a management VLAN or loopback where you
   can. The installer makes `sync.env` group-writable by the service user
   (`0660 root:unifi-dns-sync`) so the UI can save settings; it is still not
-  readable by other users.
+  readable by other users, and it stays owned by root. The service cannot
+  give a new file to root, so a save from the UI writes into the existing
+  file instead of replacing it: the complete new contents go to `sync.env.tmp`
+  first and are flushed to disk, then copied over `sync.env` under a file
+  lock, then `sync.env.tmp` is deleted. Root's edits (`--set-web-password`
+  run as root) still replace the file atomically and keep its owner and group.
+  If a save is ever interrupted, `sync.env.tmp` holds the complete new
+  settings and further saves are refused until you compare the two files,
+  keep the right one and delete `sync.env.tmp` (see Troubleshooting).
 - Sessions live in memory, so a service restart signs everyone out.
 
 ### TLS
@@ -456,6 +464,7 @@ certificate).
 | `Client renamed: X is now Y` | The client's label changed durably; the old record was removed in the same cycle. Before 1.3.0 this line alternating every few cycles was finding 1 below. |
 | `Not deleting X: the owned record marker or address no longer matches` | A record the service used to own was modified by hand; it is now yours. |
 | `Configuration error: …` on start | A required variable is missing or invalid in `sync.env`. |
+| `sync.env.tmp is left over from an interrupted settings save` on start, or `sync.env.tmp already exists` when saving | A settings save was interrupted (crash or power loss) and left its staging copy. That copy holds the complete new settings; `sync.env` may hold the old ones or, rarely, a mix. Compare them, keep the right contents in `sync.env`, delete `sync.env.tmp`, then restart. Saves are refused until then so the copy is not lost. |
 | `Web UI not started: WEB_LISTEN=… no WEB_PASSWORD_HASH is set` | Set a password with `--set-web-password`, or bind to `127.0.0.1`. The sync keeps running without the UI. |
 | `Web UI could not start on …: Address already in use` | Another program owns that port; change `WEB_LISTEN` and restart. |
 | `Web UI not started: WEB_LISTEN=… is reachable from the network but WEB_TLS_CERT is not set` | Plain HTTP on a network address is refused. Configure [TLS](#tls), bind to `127.0.0.1` and use an SSH tunnel or a reverse proxy, or set `WEB_ALLOW_INSECURE_LAN=true` to accept unencrypted logins. The sync itself keeps running. |
@@ -686,7 +695,11 @@ and restart. If you reach the web UI by a host name other than its IP address,
 `localhost` or the machine's own name, for example through a reverse proxy,
 add that name to `WEB_ALLOWED_HOSTS` first, or the UI will refuse the request.
 Saving a sensitive setting from the UI now asks for your current password.
-`UNIFI_SITE_ID` may be removed if you use the default client path.
+`UNIFI_SITE_ID` may be removed if you use the default client path. A settings
+or password save from the web UI in 1.4.0 or 1.5.0 left `sync.env` owned by
+`unifi-dns-sync` instead of root; rerunning `sudo ./install.sh` sets it back to
+`root:unifi-dns-sync`, mode `0660` (check with
+`ls -l /etc/unifi-technitium-sync/sync.env`).
 
 ## Removal
 
@@ -700,7 +713,13 @@ identifiable in Technitium by the `managed-by=unifi-technitium-sync` comment.
 ## Changelog
 
 - **1.6.0** (2026-10-09) — Fixes for the remaining findings of the October
-  2026 Codex review. Security: the web UI accepts only its own host names
+  2026 Codex review, and `sync.env` now stays owned by root when the web UI
+  saves it: the service user cannot give a new file to root, so it writes into
+  the existing file (under a lock that the UI's reads honour) after staging a
+  complete copy in `sync.env.tmp`, while root still replaces the file
+  atomically; a leftover `sync.env.tmp` from an interrupted save blocks later
+  saves instead of being overwritten and is reported at startup, and the
+  installer chowns an existing `sync.env` back to `root:unifi-dns-sync`. Security: the web UI accepts only its own host names
   (`WEB_ALLOWED_HOSTS` for more) and same-site `Origin`s, defeating DNS
   rebinding; sensitive settings need the current password again, under the
   login throttle; changing the password from the CLI ends existing sessions;
@@ -719,7 +738,7 @@ identifiable in Technitium by the `managed-by=unifi-technitium-sync` comment.
   detects repeated pages; the ownership marker must match as a whole word;
   `UNIFI_SITE_ID` is only required for paths that use it, and
   `UNIFI_SITE_NAME` fills `{site_name}`; the release script runs the tests
-  once. 92 tests.
+  once. 96 tests.
 - **1.5.0** (2026-10-09) — Fixes from a Codex code and security review.
   Login throttling can no longer be bypassed with parallel requests: attempts
   are reserved before the password hash runs, one per address at a time, five

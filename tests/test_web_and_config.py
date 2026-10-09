@@ -5,6 +5,7 @@ Run with:  python3 -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import fcntl
 import http.client
 import importlib.util
 import json
@@ -16,6 +17,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlencode
 
 from test_unifi_technitium_sync import FakeTechnitium, FakeUnifi, client, uts
@@ -66,6 +68,74 @@ class EnvFileTests(unittest.TestCase):
             after = path.stat()
             self.assertEqual(after.st_mode & 0o777, 0o660)
             self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+            self.assertNotEqual(after.st_ino, before.st_ino)  # the owner could be kept: atomic replace
+
+    def test_writer_that_cannot_keep_the_owner_rewrites_in_place(self):
+        # The service user saving the root-owned file cannot chown a new file to root, so
+        # it writes into the existing file: same inode, therefore same owner, group and mode.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "sync.env"
+            path.write_text("# keep\nA=a-long-value-that-gets-shorter\nB=1\n")
+            path.chmod(0o660)
+            before = path.stat()
+            with mock.patch.object(uts.os, "chown", side_effect=PermissionError):
+                uts.write_env_file(path, {"A": "short"})
+            after = path.stat()
+            self.assertEqual(after.st_ino, before.st_ino)
+            self.assertEqual(after.st_mode & 0o777, 0o660)
+            self.assertEqual(path.read_text(), "# keep\nA=short\nB=1\n")  # old tail truncated
+            self.assertFalse((Path(d) / "sync.env.tmp").exists())
+
+    def test_interrupted_in_place_save_leaves_new_copy_and_blocks_next_save(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, staged = Path(d) / "sync.env", Path(d) / "sync.env.tmp"
+            path.write_text("A=1\n")
+            with mock.patch.object(uts.os, "chown", side_effect=PermissionError), \
+                    mock.patch.object(uts, "overwrite_in_place", side_effect=OSError("I/O error")):
+                with self.assertRaises(OSError):
+                    uts.write_env_file(path, {"A": "2"})
+            self.assertEqual(staged.read_text(), "A=2\n")
+            # The leftover may be the only complete copy, so a later save must not clobber it.
+            with self.assertRaises(FileExistsError):
+                uts.write_env_file(path, {"A": "3"})
+            self.assertEqual(staged.read_text(), "A=2\n")
+            self.assertEqual(path.read_text(), "A=1\n")
+
+    def test_failed_replace_removes_staged_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "sync.env"
+            path.write_text("A=1\n")
+            with mock.patch.object(uts.os, "replace", side_effect=OSError("I/O error")):
+                with self.assertRaises(OSError):
+                    uts.write_env_file(path, {"A": "2"})
+            self.assertFalse((Path(d) / "sync.env.tmp").exists())
+            uts.write_env_file(path, {"A": "3"})  # nothing left behind to block the next save
+            self.assertEqual(path.read_text(), "A=3\n")
+
+    def test_readers_and_in_place_writer_exclude_each_other(self):
+        # The web UI re-reads WEB_PASSWORD_HASH on every request; a half-rewritten file
+        # could lack that line and switch authentication off for that request.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "sync.env"
+            path.write_text("WEB_PASSWORD_HASH=old\n")
+            read: dict[str, str] = {}
+            with path.open("rb") as other:
+                fcntl.flock(other, fcntl.LOCK_EX)  # a rewrite in progress
+                reader = threading.Thread(target=lambda: read.update(uts.read_env_file(path)))
+                reader.start()
+                reader.join(0.3)
+                self.assertTrue(reader.is_alive())
+            reader.join(5)
+            self.assertEqual(read, {"WEB_PASSWORD_HASH": "old"})
+            with path.open("rb") as other:
+                fcntl.flock(other, fcntl.LOCK_SH)  # a read in progress
+                writer = threading.Thread(target=uts.overwrite_in_place, args=(path, b"WEB_PASSWORD_HASH=new\n"))
+                writer.start()
+                writer.join(0.3)
+                self.assertTrue(writer.is_alive())
+                self.assertEqual(path.read_text(), "WEB_PASSWORD_HASH=old\n")
+            writer.join(5)
+            self.assertEqual(path.read_text(), "WEB_PASSWORD_HASH=new\n")
 
     def test_quoting_round_trip(self):
         for value in ['has "quotes"', "back\\slash", "sp ace", "{site_id}", ""]:

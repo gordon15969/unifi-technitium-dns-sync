@@ -43,14 +43,16 @@ install -m 0644 "$SCRIPT_DIR/unifi_technitium_web.py" \
   /opt/unifi-technitium-sync/unifi_technitium_web.py
 
 # The service user may write the settings file so the web UI can save changes;
-# the directory and file stay unreadable to everyone else.
+# the directory and file stay unreadable to everyone else. Root owns the file;
+# chown also repairs an existing file that a web UI save before 1.6.0 left
+# owned by the service user.
 install -d -m 0770 -o root -g unifi-dns-sync /etc/unifi-technitium-sync
 if [ ! -e /etc/unifi-technitium-sync/sync.env ]; then
   install -m 0660 -o root -g unifi-dns-sync \
     "$SCRIPT_DIR/unifi-technitium-sync.env.example" \
     /etc/unifi-technitium-sync/sync.env
 else
-  chgrp unifi-dns-sync /etc/unifi-technitium-sync/sync.env
+  chown root:unifi-dns-sync /etc/unifi-technitium-sync/sync.env
   chmod 0660 /etc/unifi-technitium-sync/sync.env
 fi
 
