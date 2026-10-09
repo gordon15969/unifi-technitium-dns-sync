@@ -274,7 +274,9 @@ class WebServerTests(unittest.TestCase):
         return response, raw
 
     def login(self, password):
-        response, _ = self.req("POST", "/login", form={"password": password})
+        # Sent like a browser's form POST, which always carries an Origin header.
+        response, _ = self.req("POST", "/login", form={"password": password},
+                               headers={"Origin": f"http://127.0.0.1:{self.port}"})
         self.assertEqual(response.status, 303)
         self.assertEqual(response.getheader("Location"), "/")
         cookie = response.getheader("Set-Cookie")
@@ -314,6 +316,9 @@ class WebServerTests(unittest.TestCase):
         response, raw = self.req("GET", "/login")
         self.assertEqual(response.status, 200)
         self.assertIn(b"Sign in", raw)
+        # Under "no-referrer" browsers send "Origin: null" on the form POST, which the
+        # Origin check refuses: the login page must not use that policy.
+        self.assertEqual(response.getheader("Referrer-Policy"), "same-origin")
         response, _ = self.req("POST", "/login", form={"password": "wrong"})
         self.assertEqual(response.getheader("Location"), "/login?error=1")
         cookie, csrf = self.login("correct horse battery")
@@ -633,19 +638,43 @@ class HostAndOriginTests(LiveServerCase):
             status = self.call("POST", "/api/sync", {"X-CSRF-Token": csrf, "Origin": origin})[0]
             self.assertEqual(status, expected, origin)
 
+    def test_refused_post_does_not_desync_a_kept_alive_connection(self):
+        # A reply sent before the body was read left the body on the connection, so the
+        # browser's next request failed with 501 "Unsupported method ('password=...POST')".
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            headers = {"Host": self.host, "Origin": "null",
+                       "Content-Type": "application/x-www-form-urlencoded"}
+            conn.request("POST", "/login", body=b"password=secret", headers=headers)
+            response = conn.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+            conn.request("GET", "/api/session", headers={"Host": self.host})
+            response = conn.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+        finally:
+            conn.close()
+
     def raw(self, text):
         with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
             sock.sendall(text.encode())
-            return sock.recv(200)
+            return sock.recv(4096)
 
     def test_invalid_or_oversized_bodies_are_rejected(self):
         csrf = self.call("GET", "/api/session")[1]["csrf"]
         def post(length):
             return self.raw(f"POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nX-CSRF-Token: {csrf}\r\n"
                             f"Content-Length: {length}\r\n\r\n")
-        self.assertIn(b" 400 ", post("-5"))
-        self.assertIn(b" 400 ", post("abc"))
-        self.assertIn(b" 413 ", post(str(web.MAX_BODY + 1)))
+        for length, status in (("-5", b" 400 "), ("abc", b" 400 "), (str(web.MAX_BODY + 1), b" 413 ")):
+            reply = post(length)
+            self.assertIn(status, reply, length)
+            # The unread body cannot be skipped, so the connection must not be reused.
+            self.assertIn(b"\r\nConnection: close\r\n", reply, length)
+        chunked = self.raw(f"POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nX-CSRF-Token: {csrf}\r\n"
+                           f"Transfer-Encoding: chunked\r\n\r\n")
+        self.assertIn(b" 400 ", chunked)
+        self.assertIn(b"\r\nConnection: close\r\n", chunked)
 
 
 class ConnectionLimitTests(unittest.TestCase):

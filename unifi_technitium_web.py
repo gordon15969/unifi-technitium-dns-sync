@@ -280,8 +280,30 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "unifi-technitium-sync"
     sys_version = ""
 
+    body_consumed = True
+
     def log_message(self, fmt: str, *args: Any) -> None:
         self.state.core.LOG.debug("web %s " + fmt, self.address_string(), *args)
+
+    def parse_request(self) -> bool:
+        # Nothing to drain while the request line and headers are parsed, or when they
+        # are malformed (send_error closes the connection then).
+        self.body_consumed = True
+        if not super().parse_request():
+            return False
+        self.body_consumed = False
+        return True
+
+    def end_headers(self) -> None:
+        # A reply sent before the request body was read (refused Host or Origin, 401,
+        # 403, 413...) must not leave that body on a kept-alive connection: the next
+        # request would be parsed starting with it. Discard it, or close.
+        if not self.body_consumed and not self.close_connection:
+            try:
+                self.read_body()
+            except (ValueError, OSError):
+                self.send_header("Connection", "close")
+        super().end_headers()
 
     # -- response helpers -------------------------------------------------
     def _send(self, status: int, body: bytes, content_type: str,
@@ -292,7 +314,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        # Not "no-referrer": under that policy browsers send "Origin: null" on form
+        # POSTs, which origin_ok() must refuse, and the login form stops working.
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
@@ -340,15 +364,20 @@ class Handler(BaseHTTPRequestHandler):
         return {"Set-Cookie": "; ".join(parts)}
 
     def read_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("chunked request bodies are not supported")
         raw = (self.headers.get("Content-Length") or "").strip()
         if not raw:
+            self.body_consumed = True
             return b""
         if not raw.isdigit():
             raise ValueError("invalid Content-Length")
         length = int(raw)
         if length > MAX_BODY:
             raise RequestTooLarge("request body too large")
-        return self.rfile.read(length) if length else b""
+        body = self.rfile.read(length) if length else b""
+        self.body_consumed = True
+        return body
 
     def host_ok(self) -> bool:
         """Refuse requests whose Host header is not one of ours (DNS rebinding)."""

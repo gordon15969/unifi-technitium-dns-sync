@@ -712,6 +712,15 @@ identifiable in Technitium by the `managed-by=unifi-technitium-sync` comment.
 
 ## Changelog
 
+- **1.6.1** (2026-10-09) — Fixes web UI sign-in, broken in 1.6.0. Pages were
+  served with `Referrer-Policy: no-referrer`, under which browsers send
+  `Origin: null` on a form POST, and 1.6.0's cross-origin check refused it; the
+  policy is now `same-origin`, so the login form carries the page's real
+  origin. A reply sent before the request body was read (a refused host or
+  origin, 401, 403, 413) also left the body on the kept-alive connection, so
+  the browser's next request failed with `501 Unsupported method`; such bodies
+  are now discarded, or the connection is closed when they cannot be (too
+  large, malformed length, chunked).
 - **1.6.0** (2026-10-09) — Fixes for the remaining findings of the October
   2026 Codex review, and `sync.env` now stays owned by root when the web UI
   saves it: the service user cannot give a new file to root, so it writes into
