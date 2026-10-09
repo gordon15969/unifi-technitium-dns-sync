@@ -1,0 +1,5 @@
+# Files left out of release packages (git archive)
+.gitattributes export-ignore
+.gitignore export-ignore
+.github/ export-ignore
+scripts/ export-ignore

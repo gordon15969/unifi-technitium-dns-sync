@@ -1,0 +1,22 @@
+[Unit]
+Description=UniFi to Technitium DNS synchronizer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=unifi-dns-sync
+Group=unifi-dns-sync
+Environment=CONFIG_FILE=/etc/unifi-technitium-sync/sync.env
+ExecStart=/opt/unifi-technitium-sync/unifi_technitium_sync.py
+Restart=on-failure
+RestartSec=15
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/unifi-technitium-sync /etc/unifi-technitium-sync
+
+[Install]
+WantedBy=multi-user.target

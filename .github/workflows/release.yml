@@ -1,0 +1,36 @@
+name: Release
+
+# Runs when a version tag is pushed (scripts/release.sh --tag does that).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Tag must match VERSION
+        run: |
+          version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' unifi_technitium_sync.py)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION $version in unifi_technitium_sync.py"
+            exit 1
+          fi
+      - name: Test and build the package
+        run: scripts/release.sh
+      - name: Publish the release
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; leaving it untouched."
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file dist/RELEASE_NOTES.md --latest

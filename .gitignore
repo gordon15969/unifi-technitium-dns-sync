@@ -1,0 +1,119 @@
+# =============================================================================
+# What must never be committed
+#
+# This repository is meant to become public. The live configuration holds two
+# API credentials and a password hash, the state file holds every device name
+# and MAC address on the network, and debugging tends to leave captures,
+# backups and logs of both. The rules below are deliberately broad. A file you
+# really do want tracked can be added with `git add -f` after a deliberate
+# review.
+# =============================================================================
+
+# --- Live configuration and credentials --------------------------------------
+# sync.env and every variant of it: backups, editor copies, .local, .production
+sync.env*
+.env
+.env.*
+*.env
+*.env.*
+# The sanitized template is the only env file that belongs in the repository.
+# (Keep these two lines after the patterns above; the last match wins.)
+!*.env.example
+!.env.example
+
+credentials.*
+secrets.*
+*.secret
+*.secrets
+*.token
+token.txt
+api-key*
+apikey*
+.netrc
+.htpasswd
+htpasswd
+
+# --- Keys and certificates ---------------------------------------------------
+*.pem
+*.crt
+*.cer
+*.der
+*.key
+*.csr
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+*.gpg
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*_rsa
+*_ecdsa
+*_ed25519
+deploy_key*
+
+# --- Runtime state, captures, backups and exports -----------------------------
+# state.json lists every client's name and MAC; state.json.bak-DATE and
+# state.json.tmp must stay out too.
+state.json*
+# This project has no JSON source files, so any JSON here is state or a captured
+# API response (UniFi client lists, Technitium zone dumps).
+*.json
+*.bak
+*.bak-*
+*.old
+*.orig
+*.rej
+*.save
+*.tmp
+*~
+*.swp
+*.swo
+*.zone
+*.zone.*
+*.axfr
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.pcap
+*.pcapng
+*.har
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# --- Build output --------------------------------------------------------------
+dist/
+build/
+*.egg-info/
+
+# --- Python ---------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors, OS, assistants, scratch ----------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+.history/
+.claude/
+CLAUDE.local.md
+scratch/
+tmp/
