@@ -1,5 +1,18 @@
 # UniFi → Technitium DNS Sync
 
+> **This is a vibe-coded app.** It was written almost entirely by AI coding
+> assistants (OpenAI Codex, then Claude Code) from my descriptions of what I
+> wanted, and I have tested it by running it on my own network. I built it to
+> solve one specific problem I had: giving every device on my UniFi network a
+> name in my Technitium DNS server, automatically.
+>
+> It does that job well on my setup, and I'm sharing it in case it helps
+> someone else running UniFi and Technitium together. It is not a supported
+> product: it is provided as-is with no warranty (see [License](#license)),
+> and your network may differ from mine in ways it doesn't handle. Read the
+> code, start with a [dry run](#test-with-a-dry-run), and back up your zone
+> before trusting it with your DNS.
+
 A lightweight, dependency-free Python service that reads the connected clients
 from a UniFi gateway (UniFi Dream Machine SE/Pro, or any UniFi Network
 controller) and keeps matching IPv4 `A` records (and optionally PTR records)
@@ -18,7 +31,7 @@ without touching a zone file by hand.
   contains manual records
 - Dry-run mode shows every change before you commit to anything
 
-**Status:** v1.6.0. In production since July 2026 on a Proxmox LXC, syncing
+**Status:** v1.6.1. In production since July 2026 on a Proxmox LXC, syncing
 roughly 100 UniFi clients into about 80 managed records every 5 minutes.
 1.3.0 fixed the record churn described in
 [Code review notes](#code-review-notes-october-2026), 1.4.0 added the
