@@ -1,10 +1,11 @@
 # UniFi → Technitium DNS Sync
 
-> **This is a vibe-coded app.** It was written almost entirely by AI coding
-> assistants (OpenAI Codex, then Claude Code) from my descriptions of what I
-> wanted, and I have tested it by running it on my own network. I built it to
-> solve one specific problem I had: giving every device on my UniFi network a
-> name in my Technitium DNS server, automatically.
+> **This is a vibe-coded app.** I created it with Claude Code from my
+> descriptions of what I wanted, tested the code for quality and security with
+> OpenAI Codex (a full code review and security review, with every finding
+> fixed), and run it on my own network. I built it to solve one specific
+> problem I had: giving every device on my UniFi network a name in my
+> Technitium DNS server, automatically.
 >
 > It does that job well on my setup, and I'm sharing it in case it helps
 > someone else running UniFi and Technitium together. It is not a supported
