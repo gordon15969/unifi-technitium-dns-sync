@@ -8,6 +8,8 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to full commit SHAs (the version is in the comment);
+# Dependabot (.github/dependabot.yml) proposes updates.
 jobs:
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -18,8 +20,10 @@ jobs:
         # The README promises Python 3.9+, so test the oldest and newest.
         python-version: ["3.9", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Unit and end-to-end tests
@@ -29,17 +33,37 @@ jobs:
           sh -n install.sh
           bash -n scripts/release.sh
 
+  web-ui:
+    name: Web UI script syntax
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the page's embedded JavaScript with Node
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          source = pathlib.Path("unifi_technitium_web.py").read_text()
+          script = re.search(r'PAGE_JS = r"""\n(.*?)\n"""', source, re.S).group(1)
+          pathlib.Path("page.js").write_text(script)
+          PY
+          node --version
+          node --check page.js
+
   package:
     name: Build release package
     needs: test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Build the package exactly as a release would
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/release.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-package
           path: dist/

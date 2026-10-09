@@ -32,6 +32,7 @@ def make_config(state_file: Path, **overrides) -> "uts.Config":
         unifi_url="https://udm",
         unifi_api_key="key",
         unifi_site_id="site",
+        unifi_site_name="default",
         unifi_clients_path="/clients",
         unifi_verify_tls=False,
         unifi_ca_file=None,
@@ -61,6 +62,7 @@ def make_config(state_file: Path, **overrides) -> "uts.Config":
         web_tls_cert=None,
         web_tls_key=None,
         web_allow_insecure_lan=False,
+        web_allowed_hosts=(),
     )
     values.update(overrides)
     return uts.Config(**values)
@@ -759,6 +761,245 @@ class PtrRetryTests(unittest.TestCase):
         h.cfg.state_file.write_text(json.dumps(state))
         self.assertEqual(h.run(self.nas("10.0.1.20"), advance=1), [])
         self.assertEqual(h.state()["ptr_cleanup"], [])
+        h.close()
+
+
+# --- 1.6.0: fixes for the remaining review findings ------------------------------
+import os  # noqa: E402
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+CONFIG_BASE = {
+    "UNIFI_URL": "https://udm",
+    "UNIFI_API_KEY": "k",
+    "TECHNITIUM_URL": "http://dns:5380",
+    "TECHNITIUM_API_TOKEN": "t",
+    "DNS_ZONE": ZONE,
+}
+
+
+class ConfigValidationTests(unittest.TestCase):
+    def test_site_id_is_only_required_when_the_path_uses_it(self):
+        cfg = uts.Config.from_mapping(CONFIG_BASE)
+        self.assertEqual(cfg.unifi_site_id, "")
+        self.assertEqual(cfg.unifi_clients_path.format(site_id="", site_name=cfg.unifi_site_name),
+                         "/proxy/network/api/s/default/stat/sta")
+        with self.assertRaisesRegex(ValueError, "UNIFI_SITE_ID"):
+            uts.Config.from_mapping({**CONFIG_BASE, "UNIFI_CLIENTS_PATH": "/proxy/network/integration/v1/sites/{site_id}/clients"})
+        cfg = uts.Config.from_mapping({**CONFIG_BASE, "UNIFI_CLIENTS_PATH": "/x/{site_id}/y", "UNIFI_SITE_ID": "abc"})
+        self.assertEqual(cfg.unifi_site_id, "abc")
+
+    def test_path_placeholders_and_site_name_are_validated(self):
+        for bad in ("/x/{other}/y", "/x/{0}/y", "/x/{site_name"):
+            with self.assertRaises(ValueError, msg=bad):
+                uts.Config.from_mapping({**CONFIG_BASE, "UNIFI_CLIENTS_PATH": bad})
+        with self.assertRaises(ValueError):
+            uts.Config.from_mapping({**CONFIG_BASE, "UNIFI_SITE_NAME": "a/b"})
+
+    def test_api_urls_must_be_plain_http_or_https(self):
+        for bad in ("file:///etc/passwd", "ftp://udm", "https://", "udm", "https://user:pw@udm",
+                    "https://udm/?x=1", "https://udm:99999"):
+            for key in ("UNIFI_URL", "TECHNITIUM_URL"):
+                with self.assertRaises(ValueError, msg=f"{key}={bad}"):
+                    uts.Config.from_mapping({**CONFIG_BASE, key: bad})
+        self.assertEqual(uts.Config.from_mapping({**CONFIG_BASE, "UNIFI_URL": "https://192.168.1.1/"}).unifi_url,
+                         "https://192.168.1.1")
+
+    def test_allowed_hosts_are_normalized_and_validated(self):
+        cfg = uts.Config.from_mapping({**CONFIG_BASE, "WEB_ALLOWED_HOSTS": " DNS.Example.com. ,proxy.lan"})
+        self.assertEqual(cfg.web_allowed_hosts, ("dns.example.com", "proxy.lan"))
+        with self.assertRaises(ValueError):
+            uts.Config.from_mapping({**CONFIG_BASE, "WEB_ALLOWED_HOSTS": "bad host"})
+
+
+class LocalServer:
+    """A tiny HTTP server on 127.0.0.1 answering from a route table: path -> (status, headers, body)."""
+
+    def __init__(self, routes):
+        self.hits: list[str] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.hits.append(self.path)
+                status, headers, body = routes.get(self.path.split("?")[0], (404, {}, b""))
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class RequestSafetyTests(unittest.TestCase):
+    """Credentials must never follow a redirect; error text must carry no response bodies."""
+
+    def setUp(self):
+        self.ctx = uts.ssl_context(False, None)
+
+    def test_redirects_are_not_followed(self):
+        target = LocalServer({"/steal": (200, {"Content-Type": "application/json"}, b"{}")})
+        origin = LocalServer({"/api": (302, {"Location": target.url + "/steal"}, b"")})
+        try:
+            with self.assertRaisesRegex(uts.TransportError, "HTTP 302"):
+                uts.request_json(origin.url + "/api", {"Authorization": "Bearer secret"}, 5, self.ctx)
+            self.assertEqual(target.hits, [], "the credential header must not reach the redirect target")
+        finally:
+            target.close()
+            origin.close()
+
+    def test_error_messages_carry_no_response_body_or_query(self):
+        server = LocalServer({"/err": (500, {}, b"SECRET-BODY-TEXT"), "/html": (200, {}, b"<html>SECRET-PAGE</html>")})
+        try:
+            with self.assertRaises(uts.TransportError) as caught:
+                uts.request_json(server.url + "/err?token=x", {}, 5, self.ctx)
+            self.assertNotIn("SECRET-BODY-TEXT", str(caught.exception))
+            self.assertNotIn("token=x", str(caught.exception))
+            with self.assertRaises(uts.TransportError) as caught:
+                uts.request_json(server.url + "/html", {}, 5, self.ctx)
+            self.assertNotIn("SECRET-PAGE", str(caught.exception))
+        finally:
+            server.close()
+
+    def test_only_http_and_https_urls_are_fetched(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            handle.write('{"leak": true}')
+        try:
+            with self.assertRaisesRegex(uts.TransportError, "only http and https"):
+                uts.request_json(Path(handle.name).as_uri(), {}, 5, self.ctx)
+        finally:
+            os.unlink(handle.name)
+
+
+class PaginationTests(unittest.TestCase):
+    """A misbehaving UniFi endpoint must not make pagination loop or grow without bound."""
+
+    def fetch(self, answer, **cfg):
+        offsets, urls = [], []
+        original = uts.request_json
+
+        def fake(url, headers, timeout, context, params=None):
+            urls.append(url)
+            offsets.append(params["offset"])
+            return answer(params["offset"])
+
+        uts.request_json = fake
+        try:
+            return uts.UnifiClient(make_config(Path("/nonexistent"), **cfg)).connected_clients(), offsets, urls
+        finally:
+            uts.request_json = original
+
+    @staticmethod
+    def page(start, count, total):
+        return {"data": [{"mac": f"aa0000{start + i:06x}", "ip": "10.0.0.1"} for i in range(count)],
+                "count": count, "totalCount": total}
+
+    def test_normal_paging_and_legacy_single_response(self):
+        clients, offsets, _ = self.fetch(lambda o: self.page(o, min(200, 450 - o), 450))
+        self.assertEqual((len(clients), offsets), (450, [0, 200, 400]))
+        clients, offsets, _ = self.fetch(lambda o: {"meta": {"rc": "ok"}, "data": self.page(0, 100, 0)["data"]})
+        self.assertEqual((len(clients), offsets), (100, [0]))
+
+    def test_repeated_page_stops_with_an_error(self):
+        with self.assertRaisesRegex(RuntimeError, "same page"):
+            self.fetch(lambda o: self.page(0, 200, 2_000_000_000))
+
+    def test_page_and_client_caps(self):
+        saved = (uts.MAX_UNIFI_PAGES, uts.MAX_UNIFI_CLIENTS)
+        try:
+            uts.MAX_UNIFI_PAGES = 3
+            with self.assertRaisesRegex(RuntimeError, "within 3 pages"):
+                self.fetch(lambda o: self.page(o, 1, 10**9))
+            uts.MAX_UNIFI_PAGES, uts.MAX_UNIFI_CLIENTS = 100, 250
+            with self.assertRaisesRegex(RuntimeError, "more than 250"):
+                self.fetch(lambda o: self.page(o, 200, 10**9))
+        finally:
+            uts.MAX_UNIFI_PAGES, uts.MAX_UNIFI_CLIENTS = saved
+
+    def test_garbage_counts_do_not_crash(self):
+        clients, _, _ = self.fetch(lambda o: {"data": self.page(0, 5, 5)["data"], "count": "lots", "totalCount": None})
+        self.assertEqual(len(clients), 5)
+
+    def test_site_name_is_substituted(self):
+        _, _, urls = self.fetch(lambda o: self.page(0, 1, 1),
+                                unifi_clients_path=uts.DEFAULT_CLIENTS_PATH, unifi_site_name="branch")
+        self.assertIn("/proxy/network/api/s/branch/stat/sta", urls[0])
+
+
+class OwnershipRuleTests(unittest.TestCase):
+    def test_marker_must_be_a_whole_token(self):
+        def is_managed(comment):
+            return uts.record_is_managed({"comments": comment})
+        self.assertTrue(is_managed(uts.MARKER))
+        self.assertTrue(is_managed(uts.MARKER + "; checked by hand"))
+        self.assertFalse(is_managed("not-" + uts.MARKER))
+        self.assertFalse(is_managed(uts.MARKER + "-old"))
+        self.assertFalse(is_managed(""))
+        self.assertFalse(is_managed(None))
+
+    def test_manual_record_beside_an_owned_one_freezes_the_name(self):
+        h = Harness(ip_stable_polls=1)
+        mac = "aa00000000c1"
+        h.run([client(mac, "10.0.0.10", name="nas")])
+        h.tech.zone.append(managed("nas", "10.0.0.99", comments="manual"))
+        self.assertEqual(h.run([client(mac, "10.0.0.20", name="nas")]), [], "manual records always win")
+        self.assertEqual(h.state()["managed_records"][fqdn("nas")]["ip"], "10.0.0.10", "ownership is kept")
+        self.assertEqual(h.run([client(mac, "10.0.0.20", name="nas")]), [])
+        h.tech.zone = [r for r in h.tech.zone if r["comments"] == uts.MARKER]
+        log = h.run([client(mac, "10.0.0.20", name="nas")])
+        self.assertEqual(sorted(log), sorted([("ADD", fqdn("nas"), "10.0.0.20"), ("DELETE", fqdn("nas"), "10.0.0.10")]))
+        h.close()
+
+
+class StateRepairTests(unittest.TestCase):
+    def test_malformed_entries_are_dropped_and_the_cycle_runs(self):
+        bad = {
+            "version": 2,
+            "managed_records": {
+                fqdn("ok"): {"ip": "10.0.0.5", "mac": "aa00000000d1", "last_seen": 999_000},
+                fqdn("bad"): "not-a-dict",
+                fqdn("badip"): {"ip": "999.1.1.1"},
+            },
+            "pending": {fqdn("ok"): {"ip": "nope", "count": "x"}},
+            "clients": {
+                "aa00000000d1": {"label": "ok", "field": "name", "suffix": "zz", "last_seen": "soon"},
+                "not-a-mac": {"label": "x"},
+                "aa00000000d2": {"label": "Bad Label!"},
+            },
+            "ptr_cleanup": ["junk", {"fqdn": fqdn("ok"), "address": "not-an-ip"}],
+        }
+        h = Harness(records=[managed("ok", "10.0.0.5")], state=bad)
+        with self.assertLogs("unifi-technitium-sync", "WARNING") as logs:
+            self.assertEqual(h.run([client("aa00000000d1", "10.0.0.5", name="ok")]), [])
+        self.assertTrue(any("7 malformed entries" in line for line in logs.output), logs.output)
+        state = h.state()
+        self.assertEqual(list(state["managed_records"]), [fqdn("ok")])
+        self.assertEqual((state["pending"], state["ptr_cleanup"]), ({}, []))
+        self.assertEqual(set(state["clients"]), {"aa00000000d1"})
+        self.assertEqual(state["clients"]["aa00000000d1"]["suffix"], "")
+        h.close()
+
+    def test_unusable_state_file_is_quarantined_not_overwritten(self):
+        h = Harness(records=[managed("ok", "10.0.0.5")])
+        h.cfg.state_file.write_text("{ this is not json")
+        self.assertEqual(uts.load_state(h.cfg.state_file, ZONE)["managed_records"], {})
+        self.assertTrue(h.cfg.state_file.exists(), "a plain read never moves the file")
+        h.run([client("aa00000000d1", "10.0.0.5", name="ok")])
+        corrupt = list(h.cfg.state_file.parent.glob("state.json.corrupt-*"))
+        self.assertEqual(len(corrupt), 1)
+        self.assertEqual(corrupt[0].read_text(), "{ this is not json")
+        self.assertIn(fqdn("ok"), h.state()["managed_records"], "ownership recovered from the marker")
         h.close()
 
 if __name__ == "__main__":

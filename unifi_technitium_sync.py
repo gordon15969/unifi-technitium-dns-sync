@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import getpass
 import hashlib
 import hmac
@@ -22,15 +23,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 MARKER = "managed-by=unifi-technitium-sync"
 STOP = False
 WAKE = threading.Event()
-DEFAULT_CLIENTS_PATH = "/proxy/network/api/s/default/stat/sta"
+DEFAULT_CLIENTS_PATH = "/proxy/network/api/s/{site_name}/stat/sta"
+MAX_UNIFI_PAGES = 100
+MAX_UNIFI_CLIENTS = 20000
 DEFAULT_NAME_FIELDS = "name,hostname"
 DEFAULT_STATE_FILE = "/var/lib/unifi-technitium-sync/state.json"
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
@@ -58,6 +62,36 @@ def env_int(
     return value
 
 
+def as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_text(value: Any, limit: int = 200) -> str:
+    """Text from a remote system made safe for one log line: no control characters, bounded."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value)).strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def validate_url(name: str, value: str) -> str:
+    """An API base URL: http or https, a host, and no credentials, query or fragment."""
+    url = strip_url(value)
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # noqa: B018 - raises ValueError for an invalid port
+    except ValueError as exc:
+        raise ValueError(f"{name} is not a valid URL: {exc}") from exc
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"{name} must be an http:// or https:// URL with a host name or address")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(f"{name} must not contain a user name or password")
+    if parts.query or parts.fragment:
+        raise ValueError(f"{name} must not contain a query string or fragment")
+    return url
+
+
 def parse_listen(value: str) -> tuple[str, int]:
     """Split a WEB_LISTEN value such as 0.0.0.0:8089 into host and port."""
     host, sep, port_text = value.strip().rpartition(":")
@@ -75,6 +109,7 @@ class Config:
     unifi_url: str
     unifi_api_key: str
     unifi_site_id: str
+    unifi_site_name: str
     unifi_clients_path: str
     unifi_verify_tls: bool
     unifi_ca_file: str | None
@@ -104,6 +139,7 @@ class Config:
     web_tls_cert: str | None
     web_tls_key: str | None
     web_allow_insecure_lan: bool
+    web_allowed_hosts: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -114,7 +150,6 @@ class Config:
         required = [
             "UNIFI_URL",
             "UNIFI_API_KEY",
-            "UNIFI_SITE_ID",
             "TECHNITIUM_URL",
             "TECHNITIUM_API_TOKEN",
             "DNS_ZONE",
@@ -122,6 +157,30 @@ class Config:
         missing = [name for name in required if not env.get(name, "").strip()]
         if missing:
             raise ValueError("Missing required settings: " + ", ".join(missing))
+
+        unifi_url = validate_url("UNIFI_URL", env["UNIFI_URL"])
+        technitium_url = validate_url("TECHNITIUM_URL", env["TECHNITIUM_URL"])
+        site_id = env.get("UNIFI_SITE_ID", "").strip()
+        site_name = env.get("UNIFI_SITE_NAME", "").strip() or "default"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", site_name):
+            raise ValueError("UNIFI_SITE_NAME may only contain letters, digits, '.', '_' and '-'")
+        clients_path = (env.get("UNIFI_CLIENTS_PATH") or DEFAULT_CLIENTS_PATH).strip()
+        try:
+            clients_path.format(site_id="x", site_name="x")
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "UNIFI_CLIENTS_PATH may only use the placeholders {site_id} and {site_name}"
+            ) from exc
+        if "{site_id}" in clients_path and not site_id:
+            raise ValueError("UNIFI_SITE_ID is required because UNIFI_CLIENTS_PATH contains {site_id}")
+        allowed_hosts = tuple(sorted({
+            host.strip().lower().rstrip(".")
+            for host in env.get("WEB_ALLOWED_HOSTS", "").split(",")
+            if host.strip()
+        }))
+        for host in allowed_hosts:
+            if not re.fullmatch(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?", host):
+                raise ValueError(f"WEB_ALLOWED_HOSTS: {host!r} is not a host name")
 
         networks: list[ipaddress.IPv4Network] = []
         for item in env.get("ALLOWED_NETWORKS", "").split(","):
@@ -146,13 +205,14 @@ class Config:
             raise ValueError("LOG_LEVEL must be one of " + ", ".join(LOG_LEVELS))
 
         return cls(
-            unifi_url=strip_url(env["UNIFI_URL"]),
+            unifi_url=unifi_url,
             unifi_api_key=env["UNIFI_API_KEY"].strip(),
-            unifi_site_id=env["UNIFI_SITE_ID"].strip(),
-            unifi_clients_path=(env.get("UNIFI_CLIENTS_PATH") or DEFAULT_CLIENTS_PATH).strip(),
+            unifi_site_id=site_id,
+            unifi_site_name=site_name,
+            unifi_clients_path=clients_path,
             unifi_verify_tls=env_bool("UNIFI_VERIFY_TLS", True, env),
             unifi_ca_file=env.get("UNIFI_CA_FILE") or None,
-            technitium_url=strip_url(env["TECHNITIUM_URL"]),
+            technitium_url=technitium_url,
             technitium_api_token=env["TECHNITIUM_API_TOKEN"].strip(),
             technitium_verify_tls=env_bool("TECHNITIUM_VERIFY_TLS", True, env),
             technitium_ca_file=env.get("TECHNITIUM_CA_FILE") or None,
@@ -186,6 +246,7 @@ class Config:
             web_tls_cert=env.get("WEB_TLS_CERT") or None,
             web_tls_key=env.get("WEB_TLS_KEY") or None,
             web_allow_insecure_lan=env_bool("WEB_ALLOW_INSECURE_LAN", False, env),
+            web_allowed_hosts=allowed_hosts,
         )
 
 
@@ -206,7 +267,8 @@ class Setting:
 SETTINGS: tuple[Setting, ...] = (
     Setting("UNIFI_URL", "text", "", "Base URL of the UniFi gateway, e.g. https://192.168.1.1", "UniFi", required=True),
     Setting("UNIFI_API_KEY", "secret", "", "API key from Settings → Control Plane → Integrations", "UniFi", required=True),
-    Setting("UNIFI_SITE_ID", "text", "", "Site ID from the same page; only substituted when the client path contains {site_id}", "UniFi", required=True),
+    Setting("UNIFI_SITE_ID", "text", "", "Site ID (UUID) from the same page; needed only when UNIFI_CLIENTS_PATH contains {site_id}, as the Integration API path does", "UniFi"),
+    Setting("UNIFI_SITE_NAME", "text", "default", "Site name substituted for {site_name} in UNIFI_CLIENTS_PATH; 'default' unless you run several UniFi sites", "UniFi"),
     Setting("UNIFI_CLIENTS_PATH", "text", DEFAULT_CLIENTS_PATH, "API path for the client list; the legacy stat/sta path is the only one that exposes DHCP hostnames", "UniFi"),
     Setting("UNIFI_VERIFY_TLS", "bool", "true", "Verify the gateway's TLS certificate", "UniFi"),
     Setting("UNIFI_CA_FILE", "text", "", "PEM file with the gateway's CA certificate", "UniFi"),
@@ -235,8 +297,19 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("WEB_TLS_CERT", "text", "", "PEM certificate chain to serve the web UI over HTTPS", "Web UI", restart=True),
     Setting("WEB_TLS_KEY", "text", "", "PEM private key for WEB_TLS_CERT", "Web UI", restart=True),
     Setting("WEB_ALLOW_INSECURE_LAN", "bool", "false", "Allow plain HTTP on a non-loopback WEB_LISTEN without TLS. The password and session cookie then cross the network unencrypted; prefer TLS, an SSH tunnel or an HTTPS reverse proxy", "Web UI", restart=True),
+    Setting("WEB_ALLOWED_HOSTS", "text", "", "Extra host names the UI may be reached by, comma-separated, e.g. a reverse-proxy name. IP addresses, localhost and this machine's own names are always accepted; other Host headers are refused, which blocks DNS-rebinding attacks", "Web UI"),
     Setting("WEB_PASSWORD_HASH", "secret", "", "Set with --set-web-password or the password form", "Web UI"),
 )
+
+# Changing these from the web UI requires the current password: they decide where
+# the API credentials are sent and how they are protected, which files the
+# service writes, which zone it edits, and how the UI itself is exposed.
+SENSITIVE_SETTINGS = frozenset({
+    "UNIFI_URL", "UNIFI_API_KEY", "UNIFI_VERIFY_TLS", "UNIFI_CA_FILE",
+    "TECHNITIUM_URL", "TECHNITIUM_API_TOKEN", "TECHNITIUM_VERIFY_TLS", "TECHNITIUM_CA_FILE",
+    "DNS_ZONE", "STATE_FILE",
+    "WEB_LISTEN", "WEB_TLS_CERT", "WEB_TLS_KEY", "WEB_ALLOW_INSECURE_LAN", "WEB_ALLOWED_HOSTS",
+})
 
 
 ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
@@ -299,6 +372,41 @@ def write_env_file(path: Path, updates: Mapping[str, str]) -> None:
         except PermissionError:
             pass  # not root: the file stays owned by the writing user, which can read it
     os.replace(temporary, path)
+
+
+SETTINGS_LOCK = threading.RLock()
+_SETTINGS_DEPTH = threading.local()
+
+
+@contextmanager
+def settings_lock(path: Path | None):
+    """Serialize changes to the settings file across threads and processes.
+
+    The thread lock covers the web UI's request threads; an exclusive flock on
+    the settings directory covers the CLI (--set-web-password) running beside
+    the daemon. Callers hold it across read, validation, write and the
+    in-memory swap, so concurrent saves cannot lose each other's changes.
+    Re-entrant: only the outermost holder takes the flock.
+    """
+    with SETTINGS_LOCK:
+        depth = getattr(_SETTINGS_DEPTH, "value", 0)
+        _SETTINGS_DEPTH.value = depth + 1
+        descriptor = None
+        if depth == 0 and path is not None:
+            try:
+                descriptor = os.open(path.parent, os.O_RDONLY)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except OSError as exc:
+                LOG.debug("Settings lock on %s unavailable: %s", path.parent, exc)
+                if descriptor is not None:
+                    os.close(descriptor)
+                    descriptor = None
+        try:
+            yield
+        finally:
+            _SETTINGS_DEPTH.value = depth
+            if descriptor is not None:
+                os.close(descriptor)  # releases the flock
 
 
 def hash_password(password: str, iterations: int = 200_000) -> str:
@@ -364,6 +472,33 @@ class ApiError(RuntimeError):
     """The API answered but refused the operation (Technitium status other than ok)."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: following one would send the API credentials to another URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
+def api_opener(context: ssl.SSLContext) -> urllib.request.OpenerDirector:
+    """An opener for http and https only that never follows redirects.
+
+    urlopen() would also handle file://, ftp:// and data: URLs and follow
+    redirects with the credential headers attached.
+    """
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.ProxyHandler(),
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(context=context),
+        urllib.request.HTTPDefaultErrorHandler(),
+        _NoRedirect(),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
 def request_json(
     url: str,
     headers: dict[str, str],
@@ -378,21 +513,30 @@ def request_json(
              for key, value in params.items()}
         )
         url = f"{url}{separator}{encoded}"
+    # Error messages name the endpoint without its query string, and never
+    # carry response bodies: those go to DEBUG only, cleaned and truncated.
+    parts = urllib.parse.urlsplit(url)
+    display = parts._replace(query="", fragment="").geturl()
+    if parts.scheme not in ("http", "https"):
+        raise TransportError(f"Refusing to call {display}: only http and https URLs are allowed")
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-            payload = response.read().decode("utf-8")
+        with api_opener(context).open(request, timeout=timeout) as response:
+            payload = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise TransportError(f"HTTP {exc.code} from {url}: {body[:500]}") from exc
+        LOG.debug("HTTP %s from %s, body: %s", exc.code, display, clean_text(body, 500))
+        note = "; redirects are not followed" if 300 <= exc.code < 400 else ""
+        raise TransportError(f"HTTP {exc.code} from {display}{note}") from exc
     except (urllib.error.URLError, OSError) as exc:
-        raise TransportError(f"Cannot reach {url}: {getattr(exc, 'reason', exc)}") from exc
+        raise TransportError(f"Cannot reach {display}: {clean_text(getattr(exc, 'reason', exc))}") from exc
     try:
         data = json.loads(payload)
     except json.JSONDecodeError as exc:
-        raise TransportError(f"Non-JSON response from {url}: {payload[:200]}") from exc
+        LOG.debug("Non-JSON response from %s: %s", display, clean_text(payload, 500))
+        raise TransportError(f"Non-JSON response from {display} ({len(payload)} characters)") from exc
     if not isinstance(data, dict):
-        raise TransportError(f"Unexpected response from {url}: expected a JSON object")
+        raise TransportError(f"Unexpected response from {display}: expected a JSON object")
     return data
 
 
@@ -403,7 +547,8 @@ class UnifiClient:
 
     def connected_clients(self) -> list[dict[str, Any]]:
         path = self.config.unifi_clients_path.format(
-            site_id=urllib.parse.quote(self.config.unifi_site_id, safe="")
+            site_id=urllib.parse.quote(self.config.unifi_site_id, safe=""),
+            site_name=urllib.parse.quote(self.config.unifi_site_name, safe=""),
         )
         base_url = f"{self.config.unifi_url}/{path.lstrip('/')}"
         headers = {
@@ -412,9 +557,10 @@ class UnifiClient:
             "User-Agent": f"unifi-technitium-sync/{VERSION}",
         }
         clients: list[dict[str, Any]] = []
+        seen_pages: set[tuple[str, ...]] = set()
         offset = 0
         limit = 200
-        while True:
+        for _ in range(MAX_UNIFI_PAGES):
             data = request_json(
                 base_url,
                 headers,
@@ -427,13 +573,22 @@ class UnifiClient:
                 page = data["response"].get("data")
             if not isinstance(page, list):
                 raise RuntimeError("UniFi response does not contain a client data array")
-            clients.extend(item for item in page if isinstance(item, dict))
-            count = int(data.get("count", len(page)))
-            total = int(data.get("totalCount", len(clients)))
-            if not page or count == 0 or len(clients) >= total:
-                break
+            items = [item for item in page if isinstance(item, dict)]
+            identity = tuple(sorted(
+                client_mac(item) or json.dumps(item, sort_keys=True, default=str)[:120] for item in items
+            ))
+            if items and identity in seen_pages:
+                raise RuntimeError("UniFi returned the same page of clients twice; stopping instead of looping")
+            seen_pages.add(identity)
+            clients.extend(items)
+            if len(clients) > MAX_UNIFI_CLIENTS:
+                raise RuntimeError(f"UniFi reported more than {MAX_UNIFI_CLIENTS} clients; refusing to continue")
+            count = as_int(data.get("count"), len(page))
+            total = as_int(data.get("totalCount"), len(clients))
+            if not page or count <= 0 or len(clients) >= total:
+                return clients
             offset += len(page)
-        return clients
+        raise RuntimeError(f"UniFi pagination did not finish within {MAX_UNIFI_PAGES} pages")
 
 
 class TechnitiumClient:
@@ -463,7 +618,7 @@ class TechnitiumClient:
         )
         if data.get("status") != "ok":
             message = data.get("errorMessage") or data.get("status") or "unknown error"
-            raise ApiError(f"Technitium API error: {message}")
+            raise ApiError(f"Technitium API error: {clean_text(message)}")
         return data
 
     def records(self) -> list[dict[str, Any]]:
@@ -938,8 +1093,13 @@ def record_address(record: dict[str, Any]) -> str:
 
 
 def record_is_managed(record: dict[str, Any]) -> bool:
+    """True when the record's comment carries the ownership marker as a whole token.
+
+    A substring test would also claim comments such as
+    "not-managed-by=unifi-technitium-sync".
+    """
     comments = record.get("comments", "")
-    return isinstance(comments, str) and MARKER in comments
+    return isinstance(comments, str) and MARKER in re.split(r"[\s;,|]+", comments)
 
 
 STATE_VERSION = 2
@@ -994,16 +1154,125 @@ def migrate_state(data: dict[str, Any], zone: str) -> dict[str, Any]:
     return data
 
 
-def load_state(path: Path, zone: str) -> dict[str, Any]:
+LABEL_PATTERN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+MAC_PATTERN = re.compile(r"[0-9a-f]{12}")
+
+
+def _is_ip(value: Any, version: int | None = None) -> bool:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("managed_records"), dict):
-            return migrate_state(data, zone)
+        address = ipaddress.ip_address(str(value))
+    except ValueError:
+        return False
+    return version is None or address.version == version
+
+
+def sanitize_state(data: dict[str, Any]) -> int:
+    """Drop or repair entries of the wrong shape; return how many were dropped.
+
+    A hand-edited or partly corrupted state file must not make every cycle
+    fail. Lost ownership entries are recovered from the zone's marker comments.
+    """
+    dropped = 0
+    managed: dict[str, dict[str, Any]] = {}
+    for fqdn, item in data.get("managed_records", {}).items():
+        ip = item.get("ip", "") if isinstance(item, dict) else None
+        if not isinstance(fqdn, str) or not fqdn or not (ip == "" or _is_ip(ip, 4)):
+            dropped += 1
+            continue
+        mac = str(item.get("mac", "")).lower()
+        managed[fqdn.lower().rstrip(".")] = {
+            "ip": str(ip),
+            "mac": mac if MAC_PATTERN.fullmatch(mac) else "",
+            "last_seen": max(0, as_int(item.get("last_seen"), 0)),
+        }
+    pending: dict[str, dict[str, Any]] = {}
+    for fqdn, item in data.get("pending", {}).items():
+        if isinstance(item, dict) and _is_ip(item.get("ip"), 4) and as_int(item.get("count"), 0) >= 1:
+            pending[str(fqdn)] = {"ip": str(item["ip"]), "count": as_int(item["count"], 1)}
+        else:
+            dropped += 1
+    clients: dict[str, dict[str, Any]] = {}
+    for mac, entry in data.get("clients", {}).items():
+        label = entry.get("label", "") if isinstance(entry, dict) else None
+        if (not isinstance(mac, str) or not MAC_PATTERN.fullmatch(mac) or not isinstance(label, str)
+                or (label and not LABEL_PATTERN.fullmatch(label))):
+            dropped += 1
+            continue
+        suffix = str(entry.get("suffix", ""))
+        if suffix and not (len(suffix) in SUFFIX_LENGTHS and mac.endswith(suffix)):
+            suffix = ""
+        field_name = entry.get("field", "")
+        repaired: dict[str, Any] = {
+            "label": label,
+            "field": field_name if isinstance(field_name, str) else "",
+            "suffix": suffix,
+            "last_seen": max(0, as_int(entry.get("last_seen"), 0)),
+            "label_seen": max(0, as_int(entry.get("label_seen"), 0)),
+            "downgrade_polls": max(0, as_int(entry.get("downgrade_polls"), 0)),
+        }
+        candidate = entry.get("candidate")
+        if (isinstance(candidate, dict) and isinstance(candidate.get("label"), str)
+                and LABEL_PATTERN.fullmatch(candidate["label"]) and as_int(candidate.get("count"), 0) >= 1):
+            repaired["candidate"] = {
+                "label": candidate["label"],
+                "field": str(candidate.get("field", "")),
+                "count": as_int(candidate["count"], 1),
+            }
+        clients[mac] = repaired
+    queue: list[dict[str, Any]] = []
+    for item in data.get("ptr_cleanup", []):
+        if isinstance(item, dict) and isinstance(item.get("fqdn"), str) and item["fqdn"] and _is_ip(item.get("address")):
+            queue.append({
+                "fqdn": item["fqdn"],
+                "address": str(item["address"]),
+                "since": max(0, as_int(item.get("since"), 0)),
+                "attempts": max(0, as_int(item.get("attempts"), 0)),
+            })
+        else:
+            dropped += 1
+    data["managed_records"], data["pending"], data["clients"], data["ptr_cleanup"] = managed, pending, clients, queue
+    if "last_success" in data and not isinstance(data["last_success"], int):
+        data.pop("last_success")
+    return dropped
+
+
+def load_state(path: Path, zone: str, quarantine: bool = False) -> dict[str, Any]:
+    """Read the state file, repairing malformed entries.
+
+    With quarantine=True (the sync loop) a file that is not a JSON object with
+    a managed_records mapping is renamed to <name>.corrupt-<time>, so it is
+    kept for inspection instead of being overwritten, and the cycle starts
+    fresh; ownership is then recovered from the zone's marker comments.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        pass
-    except (OSError, json.JSONDecodeError) as exc:
+        return empty_state()
+    except OSError as exc:
         LOG.warning("Ignoring unreadable state file %s: %s", path, exc)
-    return empty_state()
+        return empty_state()
+    try:
+        data = json.loads(text)
+        problem = (None if isinstance(data, dict) and isinstance(data.get("managed_records"), dict)
+                   else "it is not a state document")
+    except json.JSONDecodeError as exc:
+        data, problem = None, f"it is not valid JSON ({exc})"
+    if problem:
+        if quarantine:
+            target = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+            try:
+                os.replace(path, target)
+                LOG.error("State file %s is unusable (%s); moved it to %s and starting fresh", path, problem, target)
+            except OSError as exc:
+                LOG.error("State file %s is unusable (%s) and could not be moved aside: %s", path, problem, exc)
+        else:
+            LOG.warning("Ignoring unusable state file %s: %s", path, problem)
+        return empty_state()
+    data = migrate_state(data, zone)
+    dropped = sanitize_state(data)
+    if dropped:
+        LOG.warning("State file %s had %d malformed entr%s; dropped", path, dropped, "y" if dropped == 1 else "ies")
+    return data
 
 
 def skip_warning(skips: set[tuple[str, str]], fqdn: str, reason: str, message: str, *args: Any) -> None:
@@ -1120,7 +1389,7 @@ def _synchronize(
     action_start = len(technitium.actions)
     ptr_start = len(technitium.ptr_failures)
     deferred: list[dict[str, str]] = []
-    state = load_state(config.state_file, config.dns_zone)
+    state = load_state(config.state_file, config.dns_zone, quarantine=True)
     previous: dict[str, dict[str, Any]] = state["managed_records"]
     pending: dict[str, dict[str, Any]] = state["pending"]
     memory: dict[str, dict[str, Any]] = state["clients"]
@@ -1173,14 +1442,18 @@ def _synchronize(
                 "/".join(conflicting_types),
             )
             continue
-        if has_unmanaged and not owned:
+        if has_unmanaged:
             skip_warning(
                 skips,
                 fqdn,
                 "unmanaged",
-                "Skipping %s: an unmanaged A record already exists",
+                "Skipping %s: an unmanaged A record exists at that name; manual records always win",
                 fqdn,
             )
+            if owned:
+                # Keep tracking the record this service created, but leave the
+                # name alone (no add, no delete) while a manual record shares it.
+                next_managed[fqdn] = {**owned, "mac": item["mac"], "last_seen": now}
             continue
 
         old_address = str(owned.get("ip", "")) if owned else ""
@@ -1449,13 +1722,14 @@ class Runtime:
         """Validate, persist and activate configuration changes from the web UI."""
         if self.config_path is None:
             raise ValueError("No configuration file is in use; start with CONFIG_FILE or --config")
-        merged: dict[str, str] = dict(os.environ)
-        merged.update(read_env_file(self.config_path))
-        merged.update(updates)
-        config = Config.from_mapping(merged)
-        write_env_file(self.config_path, updates)
-        with self.lock:
-            self.config = config
+        with settings_lock(self.config_path):
+            merged: dict[str, str] = dict(os.environ)
+            merged.update(read_env_file(self.config_path))
+            merged.update(updates)
+            config = Config.from_mapping(merged)
+            write_env_file(self.config_path, updates)
+            with self.lock:
+                self.config = config
         logging.getLogger().setLevel(getattr(logging, config.log_level, logging.INFO))
         self.wake.set()
         LOG.info("Configuration updated from the web UI: %s", ", ".join(sorted(updates)))
@@ -1501,7 +1775,8 @@ def set_web_password(config_path: Path | None) -> int:
     if len(password) < 8:
         print("Password must be at least 8 characters.", file=sys.stderr)
         return 2
-    write_env_file(config_path, {"WEB_PASSWORD_HASH": hash_password(password)})
+    with settings_lock(config_path):
+        write_env_file(config_path, {"WEB_PASSWORD_HASH": hash_password(password)})
     print(f"Password hash written to {config_path}. A running web UI uses it for the next login; "
           "set WEB_LISTEN and restart the service if the UI is not enabled yet.")
     return 0

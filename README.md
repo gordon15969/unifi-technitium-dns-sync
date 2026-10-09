@@ -18,12 +18,13 @@ without touching a zone file by hand.
   contains manual records
 - Dry-run mode shows every change before you commit to anything
 
-**Status:** v1.5.0. In production since July 2026 on a Proxmox LXC, syncing
+**Status:** v1.6.0. In production since July 2026 on a Proxmox LXC, syncing
 roughly 100 UniFi clients into about 80 managed records every 5 minutes.
 1.3.0 fixed the record churn described in
 [Code review notes](#code-review-notes-october-2026), 1.4.0 added the
-[Web UI](#web-ui), and 1.5.0 fixes the findings of an October 2026 security
-review. See the [Changelog](#changelog) for release history.
+[Web UI](#web-ui), and 1.5.0 and 1.6.0 fix every finding of an October 2026
+code and security review. See the [Changelog](#changelog) for release
+history.
 
 ## Contents
 
@@ -124,14 +125,24 @@ The service only ever creates or deletes **`A` records inside the configured
 - Every record it creates carries the Technitium comment
   `managed-by=unifi-technitium-sync`. It will only delete a record when the
   marker **and** the recorded IP address both match — a record you edited by
-  hand no longer matches and is left alone.
+  hand no longer matches and is left alone. The marker must appear as a whole
+  word, so a comment such as `not-managed-by=unifi-technitium-sync` is not
+  claimed; you may add your own notes after it (`managed-by=…; checked`).
 - Existing unmanaged records always win; the service will not overwrite them.
+  If you add a manual `A` record beside one the service created, it stops
+  changing that name (no adds, no deletes) until the manual record is gone.
 - The state file provides ownership tracking across restarts; if it is lost,
   ownership is recovered from the marker comments in the zone itself.
+  Malformed entries in it (a hand edit gone wrong) are dropped with a warning
+  instead of stopping every cycle, and a file that is not usable at all is
+  moved aside as `state.json.corrupt-<time>` and rebuilt.
 - State is written atomically (temp file + rename), so a crash mid-write
   cannot corrupt it.
-- Both API credentials travel in HTTP headers, never in URLs, so they do not
-  appear in logs or error messages.
+- Both API credentials travel in HTTP headers, never in URLs, and are only
+  ever sent to the configured hosts: `UNIFI_URL` and `TECHNITIUM_URL` must be
+  plain `http://` or `https://` addresses, and redirects are never followed.
+  Error messages name the endpoint but never include response bodies (those
+  appear only at `LOG_LEVEL=DEBUG`).
 - `--dry-run` performs all reads and logs every intended change without
   writing anything.
 
@@ -208,9 +219,9 @@ Edit the configuration and fill in your values:
 sudo nano /etc/unifi-technitium-sync/sync.env
 ```
 
-At minimum set `UNIFI_URL`, `UNIFI_API_KEY`, `UNIFI_SITE_ID`,
-`TECHNITIUM_URL`, `TECHNITIUM_API_TOKEN`, `DNS_ZONE`, and
-`ALLOWED_NETWORKS`.
+At minimum set `UNIFI_URL`, `UNIFI_API_KEY`, `TECHNITIUM_URL`,
+`TECHNITIUM_API_TOKEN`, `DNS_ZONE`, and `ALLOWED_NETWORKS`. `UNIFI_SITE_ID` is
+only needed if you switch `UNIFI_CLIENTS_PATH` to the Integration API.
 
 ### Test with a dry run
 
@@ -240,8 +251,9 @@ repository; only `unifi-technitium-sync.env.example` is tracked.
 |---|---|---|
 | `UNIFI_URL` | — | Base URL of the UniFi gateway, e.g. `https://192.168.1.1` |
 | `UNIFI_API_KEY` | — | API key from Settings → Control Plane → Integrations |
-| `UNIFI_SITE_ID` | — | Site UUID from the same page (only substituted into `UNIFI_CLIENTS_PATH` when it contains `{site_id}`; see finding 3) |
-| `UNIFI_CLIENTS_PATH` | legacy `stat/sta` | API path for the client list; `{site_id}` is substituted if present |
+| `UNIFI_SITE_ID` | — | Site UUID from the same page; required only when `UNIFI_CLIENTS_PATH` contains `{site_id}` |
+| `UNIFI_SITE_NAME` | `default` | Site name substituted for `{site_name}`; change it only if you run several UniFi sites |
+| `UNIFI_CLIENTS_PATH` | legacy `/proxy/network/api/s/{site_name}/stat/sta` | API path for the client list; may use `{site_id}` and `{site_name}`. The Integration API path is `/proxy/network/integration/v1/sites/{site_id}/clients` |
 | `UNIFI_VERIFY_TLS` / `UNIFI_CA_FILE` | `true` / unset | TLS verification for the UniFi API |
 | `TECHNITIUM_URL` | — | Technitium base URL, e.g. `http://192.168.1.53:5380` |
 | `TECHNITIUM_API_TOKEN` | — | Token of a user with zone-scoped permissions |
@@ -266,6 +278,12 @@ repository; only `unifi-technitium-sync.env.example` is tracked.
 | `WEB_PASSWORD_HASH` | empty | Written by `--set-web-password` or the UI's password form; never edit by hand |
 | `WEB_TLS_CERT` / `WEB_TLS_KEY` | unset | PEM certificate chain and key to serve the UI over HTTPS; the service loads but never creates them (see [TLS](#tls)). Needs a restart |
 | `WEB_ALLOW_INSECURE_LAN` | `false` | Without TLS the UI only starts on a loopback address. `true` allows plain HTTP on a network address, sending the password and session cookie unencrypted, and puts a warning banner on every page. Needs a restart |
+| `WEB_ALLOWED_HOSTS` | empty | Extra host names the UI may be reached by (comma-separated), such as a reverse-proxy name. IP addresses, `localhost` and this machine's own names always work; requests for any other host name are refused, which blocks DNS-rebinding attacks |
+
+Settings that decide where the API credentials go and how the UI is exposed
+(the two URLs, the key and token, TLS verification and CA files, `DNS_ZONE`,
+`STATE_FILE` and every `WEB_*` setting) can only be changed from the web UI
+together with your current password.
 
 ## Reverse DNS (PTR records)
 
@@ -342,6 +360,19 @@ How it is secured:
   every client shares the proxy's address and therefore one limit.
 - Without a password the UI refuses to start on anything but a loopback
   address. Reach a loopback-only UI with `ssh -L 8089:127.0.0.1:8089 <host>`.
+- Requests must name the UI by an IP address, `localhost`, this machine's own
+  host name, or a name in `WEB_ALLOWED_HOSTS`, and a browser's `Origin` on a
+  form or API post must be one of those too. This defeats DNS rebinding, where
+  a malicious web page re-points its own domain at your server.
+- Changing a sensitive setting (see the configuration reference) requires the
+  current password again, under the same throttle as logins, so a stolen
+  session alone cannot redirect the API credentials. Changing the password,
+  from the UI or with `--set-web-password`, ends every existing session.
+- At most 32 connections are served at once; a connection that stalls for 15
+  seconds, or a TLS handshake that takes more than 10, is dropped, so slow or
+  idle clients cannot exhaust the service. Request bodies are capped at
+  256 KiB. Unexpected errors return a reference number instead of details;
+  the details go to the journal.
 - The response headers set a strict Content-Security-Policy, `X-Frame-Options:
   DENY` and `Cache-Control: no-store`.
 - Plain HTTP is only allowed on a loopback address unless you opt in with
@@ -419,7 +450,7 @@ certificate).
 
 | Log message | Meaning |
 |---|---|
-| `Skipping X: an unmanaged A record already exists` | A manual record with that name exists; the service will not touch it. Add the label to `EXCLUDED_NAMES` to silence permanently, or delete the manual record to let the service manage it. Logged once, then demoted to debug. |
+| `Skipping X: an unmanaged A record exists at that name; manual records always win` | A manual record with that name exists; the service will not touch the name, including a record it created there earlier. Add the label to `EXCLUDED_NAMES` to silence permanently, or delete the manual record to let the service manage it. Logged once, then demoted to debug. |
 | `Skipping X: conflicting CNAME record already exists` | Another record type occupies the name; resolve in Technitium. |
 | `Label for <mac>: X -> Y (…)` | The naming memory committed a new label; the parenthesis says why (a preferred field appeared, seen N polls, or the preferred field was missing for N polls). |
 | `Client renamed: X is now Y` | The client's label changed durably; the old record was removed in the same cycle. Before 1.3.0 this line alternating every few cycles was finding 1 below. |
@@ -431,6 +462,12 @@ certificate).
 | `Could not delete the PTR … will retry on later cycles` | Technitium did not answer the PTR deletion; it is queued in the state file and retried each cycle for up to 7 days. |
 | `Web UI could not start on …: [Errno 13]` / `No such file` / `[SSL]` | `WEB_TLS_CERT` or `WEB_TLS_KEY` is missing, unreadable by the `unifi-dns-sync` user, or the key does not match the certificate. See [TLS](#tls). The sync itself keeps running. |
 | `Synchronization failed` + traceback | One cycle failed (usually a timeout or an unreachable API). The service retries on the next interval; state is not written for a failed cycle. |
+| `HTTP 302 from …; redirects are not followed` | The API answered with a redirect, often `http://` redirected to `https://`. Put the final address in `UNIFI_URL` or `TECHNITIUM_URL`; credentials are never sent on to a redirect target. |
+| `State file … had N malformed entries; dropped` | Entries of the wrong shape (usually a hand edit) were removed; ownership of affected records is recovered from the zone's marker comments. |
+| `State file … is unusable …; moved it to …corrupt-…` | The file was not a state document. It was kept under the new name for inspection and the service started fresh. |
+| `UniFi returned the same page of clients twice` / `pagination did not finish` | The UniFi endpoint is paginating incorrectly; the cycle is abandoned instead of looping. Check `UNIFI_CLIENTS_PATH`. |
+| A page saying **Host not allowed**, and `Web UI refused a request for host …` in the journal | You reached the UI by a name it does not know. Use the IP address, or add the name to `WEB_ALLOWED_HOSTS`. |
+| `enter your current password to change …` when saving settings | You changed a sensitive setting; type your current password in the field above **Save settings**. |
 
 Note that the service logs to stdout, so journald records every line at
 priority *info* — `journalctl -p warning` will **not** surface warnings. Grep
@@ -464,14 +501,15 @@ sudo journalctl -u unifi-technitium-sync --since -1d -o cat | grep -oE '(ADD|DEL
 | `unifi_technitium_sync.py` | The service: settings schema and file handling, UniFi and Technitium API clients, naming memory, sync algorithm, shared runtime, CLI (`--config`, `--once`, `--dry-run`, `--backfill-ptr`, `--set-web-password`, `--log-level`) |
 | `unifi_technitium_web.py` | Optional web UI: HTTP server, JSON API, sessions, and the embedded page. Imported only when `WEB_LISTEN` is set |
 | `unifi-technitium-sync.env.example` | Annotated configuration template; copy to `/etc/unifi-technitium-sync/sync.env` |
-| `unifi-technitium-sync.service` | Hardened systemd unit (dedicated user, `ProtectSystem=strict`, state dir is the only writable path) |
-| `install.sh` | Idempotent installer: user, `/opt`, `/etc`, `/var/lib`, unit file |
+| `unifi-technitium-sync.service` | Hardened systemd unit: dedicated user, no capabilities, read-only system with only the state and settings directories writable, no device, kernel, clock or namespace access, IPv4/IPv6/Unix sockets only, `@system-service` system calls, no writable-executable memory |
+| `install.sh` | Idempotent installer: user, `/opt`, `/etc`, `/var/lib`, unit file. Refuses to install unless `/`, `/opt` and the program directory are root-owned and writable only by root, and resets the program directory's owner and mode |
 | `.gitignore` | Keeps `sync.env`, certificates, `state.json`, and bytecode out of the repository |
 | `tests/test_unifi_technitium_sync.py` | `unittest` suite, no dependencies: pure functions, state migration, and multi-poll regression fixtures for the alias-blip and de-dup churn (`python3 -m unittest discover -s tests`) |
 | `tests/test_web_and_config.py` | Settings-file round trips, validation, password hashing, the runtime, and the web UI end to end over a real socket |
 | `scripts/release.sh` | Maintainer tool, not shipped in packages: runs the tests and builds `dist/unifi-technitium-sync-X.Y.Z.tar.gz` plus `SHA256SUMS` and release notes with `git archive`; with `--tag` it tags `vX.Y.Z` and pushes the tag to start the Release workflow |
-| `.github/workflows/ci.yml` | Tests on Python 3.9, 3.11 and 3.13 for every push and pull request, plus a trial package build kept as an artifact for 7 days |
-| `.github/workflows/release.yml` | On a `vX.Y.Z` tag: checks it matches `VERSION`, runs the tests, builds the package and creates the GitHub release |
+| `.github/workflows/ci.yml` | Tests on Python 3.9, 3.11 and 3.13 for every push and pull request, a syntax check of the web UI's JavaScript with Node, and a trial package build kept as an artifact for 7 days |
+| `.github/workflows/release.yml` | On a `vX.Y.Z` tag: checks it matches `VERSION`, runs the tests and builds the package in a read-only job, then a separate job that runs no repository code verifies the checksum and creates the GitHub release. **Run workflow** on the Actions tab does the same as a dry run |
+| `.github/dependabot.yml` | Weekly update proposals for the GitHub Actions, which are pinned to full commit SHAs |
 | `.gitattributes` | Keeps `scripts/`, `.github/`, `.gitignore` and itself out of release packages |
 | `LICENSE` | MIT |
 
@@ -518,7 +556,7 @@ every time the two Wemos announce `lwip0` they collide with the third.
 the namesake has been gone for a week. Regression test:
 `test_suffix_is_sticky_across_twin_absence_and_expiry`.
 
-**3. `UNIFI_SITE_ID` is required but unused with the default endpoint.** The
+**3. `UNIFI_SITE_ID` is required but unused with the default endpoint — fixed in 1.6.0.** The
 legacy path `/proxy/network/api/s/default/stat/sta` carries the site *name*
 (`default`) and has no `{site_id}` placeholder, yet config validation still
 demands the UUID. Harmless but confusing during setup, and a non-default site
@@ -556,12 +594,9 @@ in Proxmox/Cockpit log views.
 - When a client is renamed **and** changes IP in the same cycle the new name
   is created immediately with the new IP (no dampening), which is correct but
   worth knowing.
-- The systemd unit could add `ProtectKernelTunables=true`,
-  `ProtectControlGroups=true`, `RestrictAddressFamilies=AF_INET AF_INET6`,
-  `CapabilityBoundingSet=` and `SystemCallFilter=@system-service`.
-- Error messages echo up to 500 characters of the failing response body into
-  the journal. Harmless for Technitium, but a UniFi excerpt can include
-  client names and MACs.
+- ~~The systemd unit could add more hardening directives~~ — done in 1.6.0.
+- ~~Error messages echo up to 500 characters of the failing response body
+  into the journal~~ — fixed in 1.6.0; bodies appear only at DEBUG.
 - There are no git tags for the v1.1.0 / v1.2.0 releases, only commit
   messages.
 
@@ -582,8 +617,6 @@ sync loop in the main thread with a "sync now" event, one settings schema
 shared by the file parser, the form and validation, and the daemon owning
 `sync.env`. Still open, in rough priority order:
 
-- Finding 3: require `UNIFI_SITE_ID` only when the client path uses it, and add
-  a `UNIFI_SITE_NAME` for the legacy path.
 - Exponential back-off after failed cycles (finding 6) and `sd-daemon` log
   prefixes so journald sees warning levels (finding 7).
 - IPv6 / AAAA records (finding 5).
@@ -606,7 +639,10 @@ That tags `vX.Y.Z` on the pushed commit and pushes the tag. The Release
 workflow then checks that the tag matches `VERSION`, runs the tests, builds
 `unifi-technitium-sync-X.Y.Z.tar.gz` and `SHA256SUMS` with the same script, and
 creates the GitHub release with both attached and the changelog entry as the
-notes. Follow it with `gh run watch`.
+notes. Follow it with `gh run watch`. To rehearse a release without
+publishing anything, open the Release workflow on the Actions tab and choose
+**Run workflow**: it builds and verifies the package and checks the
+publishing token, then stops.
 
 `scripts/release.sh` with no argument builds `dist/` from the current commit
 for inspection and touches nothing else. The script refuses to run with
@@ -645,6 +681,13 @@ longer starts (the journal says why). Configure `WEB_TLS_CERT` and
 `WEB_TLS_KEY`, or set `WEB_ALLOW_INSECURE_LAN=true` to keep plain HTTP. The
 state file gains a `ptr_cleanup` list automatically; nothing else changes.
 
+Upgrading to 1.6.0: rerun `sudo ./install.sh` (it installs the hardened unit)
+and restart. If you reach the web UI by a host name other than its IP address,
+`localhost` or the machine's own name, for example through a reverse proxy,
+add that name to `WEB_ALLOWED_HOSTS` first, or the UI will refuse the request.
+Saving a sensitive setting from the UI now asks for your current password.
+`UNIFI_SITE_ID` may be removed if you use the default client path.
+
 ## Removal
 
 ```sh
@@ -656,6 +699,27 @@ identifiable in Technitium by the `managed-by=unifi-technitium-sync` comment.
 
 ## Changelog
 
+- **1.6.0** (2026-10-09) — Fixes for the remaining findings of the October
+  2026 Codex review. Security: the web UI accepts only its own host names
+  (`WEB_ALLOWED_HOSTS` for more) and same-site `Origin`s, defeating DNS
+  rebinding; sensitive settings need the current password again, under the
+  login throttle; changing the password from the CLI ends existing sessions;
+  at most 32 connections with idle and TLS-handshake timeouts, TLS handshakes
+  no longer run on the accept loop, and invalid or oversized request bodies
+  are rejected; API URLs must be plain http(s) with no credentials, redirects
+  are never followed, and error messages no longer carry response bodies;
+  unexpected web errors return a reference instead of the exception; the
+  installer refuses an unsafe `/opt` and resets the program directory's owner;
+  the systemd unit is much more tightly sandboxed; GitHub Actions are pinned
+  to commit SHAs with Dependabot updates, and the release job that can write
+  runs no repository code. Correctness: concurrent settings saves (web and
+  CLI) are serialized; a manual record beside an owned one now freezes the
+  name; malformed state entries are dropped instead of stopping every cycle
+  and unusable state files are quarantined; UniFi pagination is bounded and
+  detects repeated pages; the ownership marker must match as a whole word;
+  `UNIFI_SITE_ID` is only required for paths that use it, and
+  `UNIFI_SITE_NAME` fills `{site_name}`; the release script runs the tests
+  once. 92 tests.
 - **1.5.0** (2026-10-09) — Fixes from a Codex code and security review.
   Login throttling can no longer be bypassed with parallel requests: attempts
   are reserved before the password hash runs, one per address at a time, five

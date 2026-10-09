@@ -452,5 +452,244 @@ class InsecureTransportTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+
+# --- 1.6.0: fixes for the remaining review findings ------------------------------
+import shutil  # noqa: E402
+import socket  # noqa: E402
+import ssl  # noqa: E402
+import subprocess  # noqa: E402
+
+
+class SettingsConcurrencyTests(unittest.TestCase):
+    def test_parallel_saves_keep_every_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            runtime, env_path, _ = make_runtime(Path(d), [])
+            changes = [("DNS_TTL", "301"), ("SYNC_INTERVAL", "61"), ("STALE_AFTER", "3601"),
+                       ("REQUEST_TIMEOUT", "21"), ("IP_STABLE_POLLS", "3"), ("NAME_STABLE_POLLS", "4"),
+                       ("EXCLUDED_NAMES", "x1"), ("ALLOWED_NETWORKS", "10.0.0.0/8")]
+            barrier = threading.Barrier(len(changes))
+            errors = []
+
+            def save(key, value):
+                barrier.wait()
+                try:
+                    runtime.apply_settings({key: value})
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=save, args=change) for change in changes]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            self.assertEqual(errors, [])
+            saved = uts.read_env_file(env_path)
+            for key, value in changes:
+                self.assertEqual(saved[key], value, key)
+            config = runtime.current_config()
+            self.assertEqual((config.dns_ttl, config.sync_interval, config.request_timeout), (301, 61, 21))
+            self.assertEqual(list(Path(d).glob("*.tmp")), [])
+
+    def test_settings_lock_is_reentrant_and_excludes_other_processes(self):
+        probe = ("import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); "
+                 "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "sync.env"
+            path.write_text("A=1\n")
+            with uts.settings_lock(path):
+                with uts.settings_lock(path):  # nested in one thread: must not deadlock
+                    pass
+                busy = subprocess.run([sys.executable, "-c", probe, d], capture_output=True)
+                self.assertNotEqual(busy.returncode, 0, "another process must not get the lock meanwhile")
+            free = subprocess.run([sys.executable, "-c", probe, d], capture_output=True)
+            self.assertEqual(free.returncode, 0)
+
+
+class LiveServerCase(unittest.TestCase):
+    """Starts the real web UI on 127.0.0.1 for each test."""
+
+    extra_env: dict = {}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.runtime, self.env_path, _ = make_runtime(Path(self.tmp.name), [], dict(self.extra_env))
+        self.server = web.start(self.runtime, uts)
+        self.port = self.server.server_address[1]
+        self.host = f"127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def call(self, method, path, headers=None, body=None, cookie=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        hdrs = {"Host": self.host}
+        if cookie:
+            hdrs["Cookie"] = cookie
+        hdrs.update(headers or {})
+        data = None
+        if isinstance(body, dict):
+            data = json.dumps(body).encode()
+            hdrs["Content-Type"] = "application/json"
+        elif isinstance(body, str):
+            data = body.encode()
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+        conn.request(method, path, body=data, headers=hdrs)
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        try:
+            parsed = json.loads(raw) if raw else None
+        except ValueError:
+            parsed = raw
+        return response.status, parsed, response
+
+
+class HostAndOriginTests(LiveServerCase):
+    """DNS rebinding: only our own host names may address the UI (review finding)."""
+
+    extra_env = {"WEB_ALLOWED_HOSTS": "dns.example"}
+
+    def test_foreign_host_names_are_refused(self):
+        for host in ("evil.example", f"evil.example:{self.port}", "127.0.0.1.evil.example", ""):
+            self.assertEqual(self.call("GET", "/api/session", {"Host": host})[0], 403, repr(host))
+        for host in (self.host, f"localhost:{self.port}", "dns.example", f"[::1]:{self.port}"):
+            self.assertEqual(self.call("GET", "/api/session", {"Host": host})[0], 200, host)
+
+    def test_cross_origin_posts_are_refused(self):
+        csrf = self.call("GET", "/api/session")[1]["csrf"]
+        for origin, expected in (("http://evil.example", 403), ("null", 403), (f"http://{self.host}", 200)):
+            status = self.call("POST", "/api/sync", {"X-CSRF-Token": csrf, "Origin": origin})[0]
+            self.assertEqual(status, expected, origin)
+
+    def raw(self, text):
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(text.encode())
+            return sock.recv(200)
+
+    def test_invalid_or_oversized_bodies_are_rejected(self):
+        csrf = self.call("GET", "/api/session")[1]["csrf"]
+        def post(length):
+            return self.raw(f"POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nX-CSRF-Token: {csrf}\r\n"
+                            f"Content-Length: {length}\r\n\r\n")
+        self.assertIn(b" 400 ", post("-5"))
+        self.assertIn(b" 400 ", post("abc"))
+        self.assertIn(b" 413 ", post(str(web.MAX_BODY + 1)))
+
+
+class ConnectionLimitTests(unittest.TestCase):
+    """Idle or slow connections cannot exhaust the server (review finding)."""
+
+    def test_connection_cap_and_idle_timeout(self):
+        saved = (web.MAX_CONNECTIONS, web.Handler.timeout)
+        web.MAX_CONNECTIONS, web.Handler.timeout = 2, 1
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                runtime, _, _ = make_runtime(Path(d), [])
+                server = web.start(runtime, uts)
+                port = server.server_address[1]
+                try:
+                    idle = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(2)]
+                    time.sleep(0.3)
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as third:
+                        self.assertIn(b"503", third.recv(100))
+                    for sock in idle:
+                        self.assertEqual(sock.recv(100), b"", "an idle connection is closed after the timeout")
+                        sock.close()
+                    time.sleep(0.3)
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn.request("GET", "/api/session")
+                    self.assertEqual(conn.getresponse().status, 200)
+                    conn.close()
+                finally:
+                    server.shutdown()
+                    server.server_close()
+        finally:
+            web.MAX_CONNECTIONS, web.Handler.timeout = saved
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is not installed")
+    def test_stalled_tls_handshake_does_not_block_other_clients(self):
+        with tempfile.TemporaryDirectory() as d:
+            cert, key = Path(d) / "cert.pem", Path(d) / "key.pem"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                            "-subj", "/CN=localhost", "-keyout", str(key), "-out", str(cert)],
+                           check=True, capture_output=True)
+            runtime, _, _ = make_runtime(Path(d), [], {"WEB_TLS_CERT": str(cert), "WEB_TLS_KEY": str(key)})
+            server = web.start(runtime, uts)
+            port = server.server_address[1]
+            stalled = socket.create_connection(("127.0.0.1", port), timeout=5)  # never says hello
+            try:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                started = time.monotonic()
+                conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=context)
+                conn.request("GET", "/api/session")
+                self.assertEqual(conn.getresponse().status, 200)
+                conn.close()
+                self.assertLess(time.monotonic() - started, 3)
+            finally:
+                stalled.close()  # first, so a regression fails fast instead of hanging shutdown()
+                server.shutdown()
+                server.server_close()
+
+
+class SessionAndReauthTests(LiveServerCase):
+    PASSWORD = "correct horse battery"
+    extra_env = {"WEB_PASSWORD_HASH": uts.hash_password(PASSWORD, iterations=1000)}
+
+    def setUp(self):
+        super().setUp()
+        status, _, response = self.call("POST", "/login", body=urlencode({"password": self.PASSWORD}))
+        self.assertEqual(status, 303)
+        self.cookie = response.getheader("Set-Cookie").split(";")[0]
+        self.csrf = self.call("GET", "/api/session", cookie=self.cookie)[1]["csrf"]
+
+    def post(self, path, body):
+        return self.call("POST", path, {"X-CSRF-Token": self.csrf}, body, self.cookie)
+
+    def save(self, values, password=None):
+        body = {"values": values}
+        if password is not None:
+            body["current_password"] = password
+        return self.post("/api/config", body)
+
+    def test_password_changed_from_the_cli_ends_existing_sessions(self):
+        self.assertEqual(self.call("GET", "/api/status", cookie=self.cookie)[0], 200)
+        uts.write_env_file(self.env_path, {"WEB_PASSWORD_HASH": uts.hash_password("a new password", iterations=1000)})
+        self.assertEqual(self.call("GET", "/api/status", cookie=self.cookie)[0], 401)
+
+    def test_sensitive_settings_need_the_current_password(self):
+        status, data, _ = self.save({"TECHNITIUM_URL": "http://attacker.example:8000"})
+        self.assertEqual((status, data["needs_password"]), (403, ["TECHNITIUM_URL"]))
+        self.assertEqual(self.save({"TECHNITIUM_URL": "http://attacker.example:8000"}, "wrong")[0], 403)
+        self.assertEqual(uts.read_env_file(self.env_path)["TECHNITIUM_URL"], "http://dns:5380")
+        self.assertEqual(self.save({"TECHNITIUM_URL": "http://dns2:5380"}, self.PASSWORD)[0], 200)
+        self.assertEqual(self.runtime.current_config().technitium_url, "http://dns2:5380")
+
+    def test_ordinary_settings_need_no_password(self):
+        self.assertEqual(self.save({"DNS_TTL": "600"})[0], 200)
+
+    def test_reauthentication_is_throttled(self):
+        for _ in range(web.LOGIN_MAX_FAILURES):
+            self.assertEqual(self.save({"DNS_ZONE": "x.example"}, "wrong")[0], 403)
+        self.assertEqual(self.save({"DNS_ZONE": "x.example"}, self.PASSWORD)[0], 429)
+
+    def test_unexpected_errors_do_not_leak_details(self):
+        def boom(dry_run=None):
+            raise RuntimeError("internal secret detail")
+        self.runtime.run_sync = boom
+        status, data, _ = self.post("/api/dry-run", {})
+        self.assertEqual(status, 500)
+        self.assertNotIn("internal secret detail", json.dumps(data))
+        self.assertIn("reference", data["error"])
+
+    def test_settings_list_marks_sensitive_entries(self):
+        flags = {s["key"]: s["sensitive"] for s in self.call("GET", "/api/config", cookie=self.cookie)[1]["settings"]}
+        self.assertTrue(flags["TECHNITIUM_URL"])
+        self.assertTrue(flags["WEB_LISTEN"])
+        self.assertFalse(flags["DNS_TTL"])
+
 if __name__ == "__main__":
     unittest.main()

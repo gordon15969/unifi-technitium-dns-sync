@@ -38,8 +38,14 @@ fi
 grep -q "^- \*\*$version\*\*" README.md || { echo "README.md changelog has no entry for $version" >&2; exit 1; }
 
 echo "== tests =="
-python3 -m unittest discover -s tests 2>&1 | tail -3
-python3 -m unittest discover -s tests >/dev/null 2>&1
+test_log=$(mktemp)
+trap 'rm -f "$test_log"' EXIT
+if ! python3 -m unittest discover -s tests >"$test_log" 2>&1; then
+  cat "$test_log" >&2
+  echo "Tests failed; nothing was tagged or built." >&2
+  exit 1
+fi
+tail -3 "$test_log"
 
 if $tag_release; then
   git fetch -q origin --tags

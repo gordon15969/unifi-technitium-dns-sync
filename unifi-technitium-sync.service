@@ -12,10 +12,32 @@ ExecStart=/opt/unifi-technitium-sync/unifi_technitium_sync.py
 Restart=on-failure
 RestartSec=15
 
+# Sandbox: the service only needs to make HTTP(S) connections, accept
+# connections for the optional web UI, and write its state and settings.
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0027
 ReadWritePaths=/var/lib/unifi-technitium-sync /etc/unifi-technitium-sync
 
 [Install]

@@ -19,7 +19,24 @@ id unifi-dns-sync >/dev/null 2>&1 ||
   useradd --system --gid unifi-dns-sync --home-dir /var/lib/unifi-technitium-sync \
     --shell /usr/sbin/nologin unifi-dns-sync
 
-install -d -m 0755 /opt/unifi-technitium-sync
+# systemd runs the program from /opt, so the program directory and the
+# directories above it must be owned by root and writable by nobody else;
+# otherwise another local user could swap the code before it next starts.
+APP_DIR=/opt/unifi-technitium-sync
+for dir in / /opt; do
+  if [ -L "$dir" ] || [ "$(stat -c %u "$dir")" != 0 ] || [ -n "$(find "$dir" -maxdepth 0 -perm /022)" ]; then
+    echo "$dir must be a root-owned directory that only root can write; refusing to install." >&2
+    exit 1
+  fi
+done
+if [ -L "$APP_DIR" ] || { [ -e "$APP_DIR" ] && [ ! -d "$APP_DIR" ]; }; then
+  echo "$APP_DIR exists but is not a plain directory; refusing to install into it." >&2
+  exit 1
+fi
+install -d -m 0755 -o root -g root "$APP_DIR"
+chown root:root "$APP_DIR"   # install -d leaves an existing directory's owner alone
+chmod 0755 "$APP_DIR"
+rm -rf -- "$APP_DIR/__pycache__"
 install -m 0755 "$SCRIPT_DIR/unifi_technitium_sync.py" \
   /opt/unifi-technitium-sync/unifi_technitium_sync.py
 install -m 0644 "$SCRIPT_DIR/unifi_technitium_web.py" \

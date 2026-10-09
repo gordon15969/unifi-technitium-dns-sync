@@ -12,11 +12,16 @@ main script runs as ``__main__`` and must not be loaded twice).
 
 from __future__ import annotations
 
+import hashlib
 import hmac
+import ipaddress
 import json
+import logging
 import os
 import secrets
+import socket
 import ssl
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -33,10 +38,37 @@ LOGIN_MAX_FAILURES = 5      # failed attempts allowed per address within LOGIN_W
 AUTH_CONCURRENCY = 2        # password checks (PBKDF2) running at once, all addresses
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 MAX_BODY = 256 * 1024
+LOG = logging.getLogger("unifi-technitium-sync")
+MAX_CONNECTIONS = 32        # concurrent connections; more get an immediate 503
+SOCKET_TIMEOUT = 15         # seconds a connection may stall mid-request before it is closed
+HANDSHAKE_TIMEOUT = 10      # seconds allowed for a TLS handshake
 
 
 def is_loopback(host: str) -> bool:
     return host in LOOPBACK
+
+
+def split_host(value: str) -> str:
+    """The host of a Host header or URL authority: lowercase, no port, no brackets."""
+    value = value.strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end > 0 else ""
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value.rstrip(".")
+
+
+def is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+class RequestTooLarge(ValueError):
+    """The declared request body exceeds MAX_BODY."""
 
 
 class WebState:
@@ -53,9 +85,41 @@ class WebState:
         self.anonymous = {"csrf": secrets.token_urlsafe(32), "expires": float("inf")}
         self.tls = bool(runtime.current_config().web_tls_cert)
         self.insecure_transport = False  # set by start() for plain HTTP on a network address
+        self.own_names = {"localhost"}
+        for name in (socket.gethostname(), socket.getfqdn()):
+            if name:
+                self.own_names.add(name.lower().rstrip("."))
+        self.refused_hosts: set[str] = set()
 
     def password_set(self) -> bool:
         return bool(self.runtime.password_hash())
+
+    def password_fingerprint(self) -> str:
+        """Identifies the current password hash; sessions die when it changes."""
+        return hashlib.sha256(self.runtime.password_hash().encode("utf-8")).hexdigest()
+
+    def host_allowed(self, host: str) -> bool:
+        """Accept IP literals, localhost, this machine's own names and WEB_ALLOWED_HOSTS.
+
+        Refusing every other Host header defeats DNS rebinding: a page on an
+        attacker's domain that has been re-pointed at this machine still sends
+        the attacker's domain as its Host.
+        """
+        if not host:
+            return False
+        if is_ip_literal(host) or host in self.own_names:
+            return True
+        return host in getattr(self.runtime.current_config(), "web_allowed_hosts", ())
+
+    def note_refused_host(self, host: str, client_ip: str) -> None:
+        with self.lock:
+            first = host not in self.refused_hosts and len(self.refused_hosts) < 100
+            if first:
+                self.refused_hosts.add(host)
+        (self.core.LOG.warning if first else self.core.LOG.debug)(
+            "Web UI refused a request for host %r from %s; add it to WEB_ALLOWED_HOSTS if it is yours",
+            host, client_ip,
+        )
 
     def auth_required(self) -> bool:
         return self.password_set()
@@ -68,21 +132,22 @@ class WebState:
             else:
                 del self.failures[address]
 
-    def login(self, password: str, client_ip: str) -> tuple[str, str | None]:
-        """Check a password. Returns ("ok", token), ("denied", None) or ("throttled", None).
+    def check_password(self, password: str, client_ip: str) -> str:
+        """Verify a password under the throttle. Returns "ok", "denied" or "throttled".
 
         The attempt is reserved, counted as a failure, before the slow hash
         runs, so parallel requests cannot all slip past the limit: an address
         gets one check at a time and LOGIN_MAX_FAILURES per LOGIN_WINDOW, and
-        at most AUTH_CONCURRENCY checks run at once across all addresses.
+        at most AUTH_CONCURRENCY checks run at once across all addresses. Used
+        for logins and for re-authentication before sensitive changes.
         """
         now = time.time()
         with self.lock:
             self._prune_failures(now)
             if client_ip in self.inflight or len(self.failures.get(client_ip, [])) >= LOGIN_MAX_FAILURES:
-                return "throttled", None
+                return "throttled"
             if not self.auth_slots.acquire(blocking=False):
-                return "throttled", None
+                return "throttled"
             self.inflight.add(client_ip)
             self.failures.setdefault(client_ip, []).append(now)
         try:
@@ -92,12 +157,26 @@ class WebState:
                 self.inflight.discard(client_ip)
             self.auth_slots.release()
         if not ok:
-            return "denied", None
-        token = secrets.token_urlsafe(32)
+            return "denied"
         with self.lock:
             self.failures.pop(client_ip, None)
+        return "ok"
+
+    def login(self, password: str, client_ip: str) -> tuple[str, str | None]:
+        """Check a password and open a session: ("ok", token), ("denied", None) or ("throttled", None)."""
+        outcome = self.check_password(password, client_ip)
+        if outcome != "ok":
+            return outcome, None
+        now = time.time()
+        token = secrets.token_urlsafe(32)
+        fingerprint = self.password_fingerprint()
+        with self.lock:
             self.sessions = {t: s for t, s in self.sessions.items() if s["expires"] > now}
-            self.sessions[token] = {"csrf": secrets.token_urlsafe(32), "expires": now + SESSION_TTL}
+            self.sessions[token] = {
+                "csrf": secrets.token_urlsafe(32),
+                "expires": now + SESSION_TTL,
+                "pw": fingerprint,
+            }
         return "ok", token
 
     def session(self, token: str | None) -> dict[str, Any] | None:
@@ -106,9 +185,11 @@ class WebState:
         if not token:
             return None
         now = time.time()
+        fingerprint = self.password_fingerprint()
         with self.lock:
             session = self.sessions.get(token)
-            if session is None or session["expires"] <= now:
+            if session is None or session["expires"] <= now or session.get("pw") != fingerprint:
+                # Expired, or the password changed since login (from the UI or the CLI).
                 self.sessions.pop(token, None)
                 return None
             session["expires"] = now + SESSION_TTL
@@ -177,6 +258,7 @@ def config_payload(state: WebState) -> dict[str, Any]:
             "required": spec.required,
             "choices": list(spec.choices),
             "restart": spec.restart,
+            "sensitive": spec.key in core.SENSITIVE_SETTINGS,
         }
         if spec.kind == "secret":
             entry["value"] = ""
@@ -193,6 +275,7 @@ def config_payload(state: WebState) -> dict[str, Any]:
 
 class Handler(BaseHTTPRequestHandler):
     state: WebState
+    timeout = SOCKET_TIMEOUT  # applied to the connection by StreamRequestHandler.setup()
     protocol_version = "HTTP/1.1"
     server_version = "unifi-technitium-sync"
     sys_version = ""
@@ -257,10 +340,38 @@ class Handler(BaseHTTPRequestHandler):
         return {"Set-Cookie": "; ".join(parts)}
 
     def read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length") or 0)
+        raw = (self.headers.get("Content-Length") or "").strip()
+        if not raw:
+            return b""
+        if not raw.isdigit():
+            raise ValueError("invalid Content-Length")
+        length = int(raw)
         if length > MAX_BODY:
-            raise ValueError("request body too large")
+            raise RequestTooLarge("request body too large")
         return self.rfile.read(length) if length else b""
+
+    def host_ok(self) -> bool:
+        """Refuse requests whose Host header is not one of ours (DNS rebinding)."""
+        host = split_host(self.headers.get("Host", ""))
+        if self.state.host_allowed(host):
+            return True
+        self.state.note_refused_host(host[:100], self.client_ip())
+        self.send_html(
+            "<!doctype html><title>Host not allowed</title><p>This host name is not allowed for "
+            "the UniFi &rarr; Technitium web UI. Use the server's IP address, or add the name to "
+            "WEB_ALLOWED_HOSTS.</p>",
+            403,
+        )
+        return False
+
+    def origin_ok(self) -> bool:
+        """A browser's Origin on a state-changing request must also be one of our hosts."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        if origin.strip().lower() == "null":
+            return False
+        return self.state.host_allowed(split_host(urlsplit(origin.strip()).netloc))
 
     def read_json(self) -> dict[str, Any]:
         body = self.read_body()
@@ -279,6 +390,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- GET ----------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802 - http.server API
+        if not self.host_ok():
+            return
         parts = urlsplit(self.path)
         path = parts.path
         if path == "/login":
@@ -310,6 +423,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- POST ---------------------------------------------------------------
     def do_POST(self) -> None:  # noqa: N802
+        if not self.host_ok():
+            return
+        if not self.origin_ok():
+            return self.send_json({"error": "cross-origin request refused"}, 403)
         path = urlsplit(self.path).path
         try:
             if path == "/login":
@@ -333,11 +450,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/password":
                 return self.handle_password()
             self.send_json({"error": "not found"}, 404)
+        except RequestTooLarge as exc:
+            self.send_json({"error": str(exc)}, 413)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, 400)
-        except Exception as exc:  # noqa: BLE001 - report, never crash the server thread
-            self.state.core.LOG.exception("Web request failed")
-            self.send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+        except Exception:  # noqa: BLE001 - report, never crash the server thread
+            reference = secrets.token_hex(4)
+            self.state.core.LOG.exception("Web request failed (reference %s)", reference)
+            self.send_json({"error": f"internal error; see the service log for reference {reference}"}, 500)
 
     def handle_login(self) -> None:
         if not self.state.auth_required():
@@ -353,7 +473,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.redirect("/", self.cookie_header(token, SESSION_TTL))
 
     def handle_config(self) -> None:
-        values = self.read_json().get("values")
+        data = self.read_json()
+        values = data.get("values")
         if not isinstance(values, dict):
             raise ValueError("expected a 'values' object")
         specs = {spec.key: spec for spec in self.state.core.SETTINGS}
@@ -372,7 +493,32 @@ class Handler(BaseHTTPRequestHandler):
             updates[spec.key] = text
         if not updates:
             return self.send_json({"ok": True, "changed": [], "restart": []})
-        self.state.runtime.apply_settings(updates)
+        core, runtime = self.state.core, self.state.runtime
+        current = core.read_env_file(runtime.config_path) if runtime.config_path else {}
+        sensitive = sorted(
+            key for key, value in updates.items()
+            if key in core.SENSITIVE_SETTINGS and value != current.get(key, "")
+        )
+        if sensitive and self.state.auth_required():
+            # These decide where the API credentials go, which files are written and how
+            # the UI is exposed: a stolen session alone must not be enough to change them.
+            password = data.get("current_password")
+            if not isinstance(password, str) or not password:
+                return self.send_json({
+                    "error": "enter your current password to change " + ", ".join(sensitive),
+                    "needs_password": sensitive,
+                }, 403)
+            outcome = self.state.check_password(password, self.client_ip())
+            if outcome == "throttled":
+                return self.send_json({"error": "too many password attempts; wait a few minutes",
+                                       "needs_password": sensitive}, 429)
+            if outcome != "ok":
+                core.LOG.warning("Settings change from %s refused: wrong current password", self.client_ip())
+                return self.send_json({"error": "current password is wrong", "needs_password": sensitive}, 403)
+        runtime.apply_settings(updates)
+        if sensitive:
+            core.LOG.warning("Sensitive settings changed from the web UI by %s: %s",
+                             self.client_ip(), ", ".join(sensitive))
         return self.send_json({
             "ok": True,
             "changed": sorted(updates),
@@ -386,18 +532,86 @@ class Handler(BaseHTTPRequestHandler):
         runtime, core = self.state.runtime, self.state.core
         if len(new) < 8:
             raise ValueError("the new password must be at least 8 characters")
-        stored = runtime.password_hash()
-        if stored and not core.verify_password(stored, current):
-            return self.send_json({"error": "current password is wrong"}, 403)
+        if runtime.password_hash():
+            outcome = self.state.check_password(current, self.client_ip())
+            if outcome == "throttled":
+                return self.send_json({"error": "too many password attempts; wait a few minutes"}, 429)
+            if outcome != "ok":
+                return self.send_json({"error": "current password is wrong"}, 403)
         if runtime.config_path is None:
             raise ValueError("no configuration file is in use; use --config")
         digest = core.hash_password(new)
-        core.write_env_file(runtime.config_path, {"WEB_PASSWORD_HASH": digest})
-        with runtime.lock:
-            runtime.config = replace(runtime.config, web_password_hash=digest)
+        with core.settings_lock(runtime.config_path):
+            core.write_env_file(runtime.config_path, {"WEB_PASSWORD_HASH": digest})
+            with runtime.lock:
+                runtime.config = replace(runtime.config, web_password_hash=digest)
         self.state.invalidate_all()
         core.LOG.info("Web UI password changed from %s", self.client_ip())
         return self.send_json({"ok": True, "relogin": True})
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a connection cap and TLS handshakes off the accept loop.
+
+    The stock server starts one thread per connection without limit, and
+    wrapping its listening socket in TLS makes accept() run every handshake in
+    the single accepting thread, where one stalled client blocks everyone.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, ssl_context: ssl.SSLContext | None = None,
+                 max_connections: int = MAX_CONNECTIONS):
+        self.ssl_context = ssl_context
+        self.slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            if self.ssl_context is None:
+                try:
+                    request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
+                                    b"Connection: close\r\nRetry-After: 5\r\n\r\n")
+                except OSError:
+                    pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def handle_error(self, request, client_address):
+        """Log instead of printing a traceback to stderr; a client hanging up is routine."""
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, TimeoutError, ssl.SSLError)):
+            LOG.debug("Web UI connection from %s ended: %s", client_address[0], error)
+        else:
+            LOG.exception("Web UI request from %s failed", client_address[0])
+
+    def finish_request(self, request, client_address):
+        if self.ssl_context is None:
+            return super().finish_request(request, client_address)
+        request.settimeout(HANDSHAKE_TIMEOUT)
+        try:
+            connection = self.ssl_context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return None
+        try:
+            self.RequestHandlerClass(connection, client_address, self)
+        finally:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        return None
 
 
 def start(runtime: Any, core: Any) -> ThreadingHTTPServer | None:
@@ -434,14 +648,14 @@ def start(runtime: Any, core: Any) -> ThreadingHTTPServer | None:
         pass
 
     BoundHandler.state = state
-    server = ThreadingHTTPServer((host, port), BoundHandler)
-    server.daemon_threads = True
+    context = None
     scheme = "http"
     if config.web_tls_cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(config.web_tls_cert, config.web_tls_key)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
         scheme = "https"
+    server = BoundedHTTPServer((host, port), BoundHandler, ssl_context=context,
+                               max_connections=MAX_CONNECTIONS)
     thread = threading.Thread(target=server.serve_forever, name="web-ui", daemon=True)
     thread.start()
     core.LOG.info(
@@ -615,7 +829,7 @@ PAGE_JS = r"""
         else { input = el('input', { type: s.kind === 'int' ? 'number' : 'text', value: s.value || '', placeholder: s.default ? 'default: ' + s.default : '' }); }
         input.name = s.key; input.id = 'f-' + s.key;
         S.initial[s.key] = s.kind === 'secret' ? '' : input.value;
-        const help = s.help + (s.required ? ' (required)' : '') + (s.restart ? ' — needs a service restart' : '');
+        const help = s.help + (s.required ? ' (required)' : '') + (s.restart ? ' — needs a service restart' : '') + (s.sensitive && BOOT.auth ? ' — changing this requires your current password' : '');
         fs.append(el('div', { class: 'field' }, el('label', { for: input.id, text: s.key }), el('div', null, input, el('small', { text: help }))));
       }
       form.append(fs);
@@ -623,6 +837,8 @@ PAGE_JS = r"""
     $('#config-path').textContent = c.path ? ('Settings file: ' + c.path + (c.writable ? '' : ' (not writable by the service user; saving will fail)')) : 'No settings file in use (start the service with CONFIG_FILE or --config to enable editing).';
     $('#save').disabled = !c.writable;
     $('#pw-current-row').hidden = !BOOT.auth;
+    $('#reauth-row').hidden = !BOOT.auth;
+    $('#reauth').value = '';
   }
   async function saveConfig(ev) {
     ev.preventDefault();
@@ -633,8 +849,15 @@ PAGE_JS = r"""
       else if (input.value !== S.initial[s.key]) values[s.key] = input.value;
     }
     if (!Object.keys(values).length) { message('#config-msg', 'Nothing changed.'); return; }
+    const body = { values };
+    const sensitive = Object.keys(values).filter(k => S.config.settings.some(s => s.key === k && s.sensitive));
+    if (sensitive.length && BOOT.auth) {
+      const pw = $('#reauth').value;
+      if (!pw) { message('#config-msg', 'Enter your current password to change ' + sensitive.join(', ') + '.', 'err'); $('#reauth').focus(); return; }
+      body.current_password = pw;
+    }
     try {
-      const r = await api('/api/config', { method: 'POST', body: { values } });
+      const r = await api('/api/config', { method: 'POST', body });
       message('#config-msg', 'Saved ' + r.changed.join(', ') + (r.restart.length ? '. Restart the service for: ' + r.restart.join(', ') + '.' : '. Changes apply from the next cycle.'), 'ok');
       renderConfig();
     } catch (e) { message('#config-msg', 'Not saved: ' + e.message, 'err'); }
@@ -727,6 +950,11 @@ PAGE_HTML = r"""<!doctype html>
   <section id="tab-config" hidden>
     <p class="muted" id="config-path"></p>
     <form id="settings" class="settings"></form>
+    <div class="toolbar" id="reauth-row" hidden>
+      <label for="reauth">Current password</label>
+      <input id="reauth" type="password" autocomplete="current-password">
+      <span class="muted">needed to save settings marked as requiring it</span>
+    </div>
     <div class="toolbar"><button class="primary" id="save" type="submit" form="settings">Save settings</button></div>
     <div id="config-msg"></div>
     <h3>Web UI password</h3>
